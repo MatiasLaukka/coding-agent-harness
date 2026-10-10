@@ -155,8 +155,13 @@ Run whatever focused checks are useful while implementing, but do not claim that
 the harness's independent verification has passed. The harness will run its own
 verification after you exit.
 
-When you have finished, print exactly one final machine-readable completion line
-using this prefix:
+When implementation work is finished, stop invoking tools. Emit exactly one final
+completion line in your final assistant response through the CLI's normal stdout.
+{COMPLETION_PREFIX} is an output marker, not a filename. Do not create HARNESS_RESULT,
+HARNESS_RESULT.txt, or similar completion artifacts. Do not invoke tools or shell
+commands to create or print the completion record.
+
+Use this output prefix:
 
 {COMPLETION_PREFIX}
 

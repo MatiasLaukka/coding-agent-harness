@@ -271,3 +271,27 @@ def test_render_task_prompt_defines_changed_files_as_per_attempt() -> None:
         "modified during this worker invocation only."
         in prompt
     )
+
+
+def test_render_task_prompt_routes_completion_to_final_response() -> None:
+    prompt = _render_task_prompt(make_task())
+    assert "HARNESS_RESULT: is an output marker, not a filename." in prompt
+    assert "final assistant response through the CLI's normal stdout" in prompt
+    assert "Emit exactly one final" in prompt
+
+
+def test_render_task_prompt_prohibits_completion_artifacts_and_tools() -> None:
+    prompt = _render_task_prompt(make_task())
+    assert "Do not create HARNESS_RESULT," in prompt
+    assert "HARNESS_RESULT.txt, or similar completion artifacts." in prompt
+    assert "Do not invoke tools or shell" in prompt
+    assert "commands to create or print the completion record." in prompt
+
+
+def test_render_task_prompt_stops_tools_and_preserves_completion_schema() -> None:
+    prompt = _render_task_prompt(make_task())
+    assert "When implementation work is finished, stop invoking tools." in prompt
+    assert '"status": "completed" | "blocked" | "failed"' in prompt
+    for field in ('summary', 'changed_files', 'remaining_concerns'):
+        assert f'"{field}"' in prompt
+    assert "modified during this worker invocation only." in prompt
