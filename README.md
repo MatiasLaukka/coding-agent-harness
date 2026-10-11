@@ -37,7 +37,7 @@ flowchart TD
 
 The caller supplies a `TaskPacket`: goal, constraints, acceptance criteria, suggested files, and optional allowed files. Planning is an upstream responsibility; no hosted planner adapter or provider SDK is implemented here.
 
-`QwenWorker` invokes a caller-configured executable as `qwen --model <model> -p <prompt>`. It expects a final JSON completion line prefixed by `HARNESS_RESULT:`. The result contains `status`, `summary`, `changed_files`, and `remaining_concerns`. Changed-file claims refer only to the current worker invocation. A local subprocess does not imply local model inference; the Qwen executable's own configuration determines its backend.
+`QwenWorker` invokes a caller-configured executable as `qwen --model <model> -p <prompt>`. It expects exactly one JSON completion line prefixed by `HARNESS_RESULT:`. Multiple records or duplicate JSON keys are protocol failures; raw process output remains available. The result contains `status`, `summary`, `changed_files`, and `remaining_concerns`. Changed-file claims refer only to the current worker invocation. A local subprocess does not imply local model inference; the Qwen executable's own configuration determines its backend.
 
 The controller accepts a caller-supplied reviewer with a `review(...)` method. It receives the current task, worker result and assessment, cumulative Git evidence, verification results, and attempt number, and returns a `ReviewDecision`: `accept`, `remediate`, `stop`, or `revise-scope`. No concrete hosted reviewer integration is included.
 
@@ -59,7 +59,7 @@ Verification commands are argument arrays executed independently after each work
 
 An empty command list performs no checks and currently yields success. Callers must supply meaningful verification.
 
-`allowed_files=None` imposes no file restriction; `[]` permits no changed files; a list is an exact repository-relative allowlist. Scope checks detect cumulative out-of-scope changes immediately after the worker invocation. They do not prevent writes or roll them back. Filesystem changes made by verification commands or the reviewer are not recaptured before acceptance. A reviewer can explicitly revise scope with a nonempty list and rationale; the revision is audited and subsequent remediation preserves it.
+`allowed_files=None` imposes no file restriction; `[]` permits no changed files; a list is an exact repository-relative allowlist. Scope checks detect cumulative out-of-scope changes immediately after the worker invocation. Rename sources and destinations are both changed paths and both require allowlist coverage. They do not prevent writes or roll them back. Filesystem changes made by verification commands or the reviewer are not recaptured before acceptance. A reviewer can explicitly revise scope with a nonempty list and rationale; the revision is audited and subsequent remediation preserves it.
 
 Remediation and scope revision share `max_remediation_attempts` (default 2), allowing at most three worker invocations by default. The reviewer cannot accept an execution/protocol failure, a scope violation, or failed required verification. A valid worker report of `blocked` or `failed` may be accepted by the reviewer with a disagreement audit event.
 
@@ -124,7 +124,7 @@ For reviewer-driven runs, use `HarnessController(worker=..., reviewer=..., max_r
 review(*, task, worker_result, worker_assessment, evidence, verification, attempt)
 ```
 
-The reviewer must return a validated `ReviewDecision`. `QwenWorker` is the provided worker adapter. Integration with a human review UI or hosted model is left to the caller. The returned `HarnessRunResult` contains status, attempt count, and audit events; evidence is passed to the reviewer rather than persisted automatically.
+The reviewer must return a validated `ReviewDecision`. The controller revalidates it before branching; malformed decisions raise without authorizing another worker invocation. Remediation budgets must be nonnegative integers; booleans and nonfinite or fractional values are rejected. `QwenWorker` is the provided worker adapter. Integration with a human review UI or hosted model is left to the caller. The returned `HarnessRunResult` contains status, attempt count, and audit events; evidence is passed to the reviewer rather than persisted automatically.
 
 ## Offline supervisor handoff
 
