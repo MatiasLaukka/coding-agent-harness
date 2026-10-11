@@ -567,7 +567,7 @@ def test_preflight_scope_link_escape(repo,tmp_path,destination):
     else:
         link.symlink_to(target,target_is_directory=True)
     # Ignore the junction itself so scope resolution, not dirt, is under test.
-    (repo/".git"/"info"/"exclude").write_text("linked/\n")
+    (repo/".git"/"info"/"exclude").write_text("/linked\n")
     p=bound_proposal(repo)
     p.task_spec.task.allowed_files=["linked/file.py"]
     path,directory=save_approval(tmp_path,p)
