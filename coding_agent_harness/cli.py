@@ -215,6 +215,23 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    handoff_parser = subparsers.add_parser(
+        "handoff", help="Validate supervisor documents; never execute proposals.")
+    handoff_commands = handoff_parser.add_subparsers(dest="handoff_command", required=True)
+    for name in ("validate", "preflight"):
+        command = handoff_commands.add_parser(name)
+        command.add_argument("proposal", type=Path)
+        command.add_argument("--repo", required=True, type=Path)
+        command.add_argument("--handoff", type=Path)
+        command.add_argument("--approval", type=Path, required=name == "preflight")
+        command.add_argument("--approval-dir", type=Path, required=name == "preflight")
+        command.add_argument("--untrusted-root", type=Path, action="append", default=[])
+        if name == "validate":
+            command.add_argument("--output", type=Path)
+        else:
+            command.add_argument("--task-file", type=Path, required=True)
+            command.add_argument("--execution-config", type=Path, required=True)
+
     return parser
 
 
@@ -223,6 +240,9 @@ def app(
 ) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
+
+    if args.command == "handoff":
+        return _handoff_app(args)
 
     if args.command != "run":
         parser.error(
@@ -288,3 +308,53 @@ def app(
         return 0
 
     return 2
+
+
+def _handoff_app(args) -> int:
+    from .supervisor import (
+        ExecutionConfig, HandoffError, ValidationFeedback, execution_preflight,
+        load_document, load_handoff, load_operator_approval, load_proposal,
+        materialize_task_file, validate_proposal, _write_output,
+    )
+
+    try:
+        if bool(args.approval) != bool(args.approval_dir):
+            raise HandoffError("approval_directory_required")
+        proposal = load_proposal(args.proposal)
+        handoff = load_handoff(args.handoff) if args.handoff else None
+        if args.handoff_command == "preflight":
+            spec = load_document(args.task_file, TaskFile)
+            config = load_document(args.execution_config, ExecutionConfig)
+            feedback = execution_preflight(
+                proposal, handoff=handoff, approval_path=args.approval,
+                trusted_approval_dir=args.approval_dir,
+                untrusted_workspace_roots=args.untrusted_root, repo_dir=args.repo,
+                task=spec.task, verification_commands=spec.verification_commands,
+                execution_config=config)
+            input_errors = {
+                "invalid_document", "document_too_large", "parent_binding_mismatch",
+                "parent_handoff_required", "unsupported_acceptance",
+            }
+            code = (0 if feedback.passed else
+                    1 if input_errors.intersection(feedback.errors) else 2)
+        else:
+            approval = load_operator_approval(
+                args.approval, trusted_dir=args.approval_dir, target_repo=args.repo,
+                untrusted_workspace_roots=args.untrusted_root) if args.approval else None
+            feedback = validate_proposal(proposal, handoff=handoff, approval=approval)
+            code = (2 if feedback.status == "needs_operator_approval" else
+                    1 if feedback.status == "invalid" else 0)
+            if args.output:
+                if feedback.status == "approval_validated":
+                    _write_output(args.output, materialize_task_file(
+                        proposal, handoff=handoff, approval=approval))
+                elif feedback.status == "nonexecuting_recommendation":
+                    raise HandoffError("task_not_approved")
+        print(json.dumps(feedback.model_dump(mode="json"), sort_keys=True))
+        return code
+    except HandoffError as error:
+        feedback = ValidationFeedback(status="invalid", errors=[str(error)])
+    except (OSError, ValueError, TypeError):
+        feedback = ValidationFeedback(status="invalid", errors=["invalid_document"])
+    print(json.dumps(feedback.model_dump(mode="json"), sort_keys=True))
+    return 1
