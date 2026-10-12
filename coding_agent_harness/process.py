@@ -16,6 +16,9 @@ from coding_agent_harness.models import StrictModel
 # without a deadline. These bounds are independent of worker protocol content.
 OUTPUT_LIMIT_BYTES = 1024 * 1024
 DRAIN_SECONDS = 0.2
+PROCESS_CLEANUP_RESERVE_SECONDS = 2.0
+PROCESS_TREE_TERMINATE_WAIT_SECONDS = 0.5
+PROCESS_TREE_KILL_WAIT_SECONDS = 1.0
 
 
 class ProcessResult(StrictModel):
@@ -72,7 +75,7 @@ def _kill_process_tree(pid: int) -> CleanupResult:
             pass
         except psutil.Error as exc:
             result.errors.append('terminate:' + type(exc).__name__)
-    _, alive = psutil.wait_procs(processes, timeout=0.5)
+    _, alive = psutil.wait_procs(processes, timeout=PROCESS_TREE_TERMINATE_WAIT_SECONDS)
     for process in alive:
         try:
             process.kill()
@@ -80,13 +83,54 @@ def _kill_process_tree(pid: int) -> CleanupResult:
             pass
         except psutil.Error as exc:
             result.errors.append('kill:' + type(exc).__name__)
-    _, alive = psutil.wait_procs(alive, timeout=1)
+    _, alive = psutil.wait_procs(alive, timeout=PROCESS_TREE_KILL_WAIT_SECONDS)
     result.surviving_pids = [p.pid for p in alive]
     return result
 
 
+def _kill_process_tree_before_deadline(pid: int, deadline: float) -> CleanupResult:
+    """Bound process-tree cleanup to the caller's absolute phase deadline."""
+    result: list[CleanupResult] = []
+    errors: list[str] = []
+
+    def cleanup() -> None:
+        try:
+            value = _kill_process_tree(pid)
+            if isinstance(value, CleanupResult):
+                result.append(value)
+            else:
+                errors.append('cleanup-result-unavailable')
+        except BaseException as exc:
+            errors.append('cleanup:' + type(exc).__name__)
+
+    thread = threading.Thread(target=cleanup, daemon=True, name='harness-process-cleanup')
+    try:
+        thread.start()
+    except Exception as exc:
+        return CleanupResult(
+            errors=['cleanup-start:' + type(exc).__name__],
+            surviving_pids=[pid],
+        )
+
+    thread.join(max(0.0, deadline - time.monotonic()))
+    if thread.is_alive() or time.monotonic() >= deadline:
+        return CleanupResult(
+            errors=['cleanup-deadline'],
+            surviving_pids=[pid],
+        )
+    if errors:
+        return CleanupResult(errors=errors, surviving_pids=[pid])
+    if not result:
+        return CleanupResult(
+            errors=['cleanup-result-unavailable'],
+            surviving_pids=[pid],
+        )
+    return result[0]
+
+
 class _Capture:
     def __init__(self):
+        self.output_limit_bytes = OUTPUT_LIMIT_BYTES
         self.data = bytearray()
         self.lock = threading.Lock()
         self.done = threading.Event()
@@ -107,7 +151,7 @@ class _Capture:
                     with self.lock:
                         if self.stop.is_set():
                             break
-                        remaining = OUTPUT_LIMIT_BYTES - len(self.data)
+                        remaining = self.output_limit_bytes - len(self.data)
                         self.data.extend(chunk[:remaining])
                         self.truncated |= len(chunk) > remaining
             except Exception as exc:
@@ -134,17 +178,64 @@ class _Capture:
             return bytes(self.data).decode('utf-8', errors='replace')
 
 
-def run_process(*, argv: Sequence[str], cwd: Path, timeout_seconds: float) -> ProcessResult:
+def run_process(
+    *,
+    argv: Sequence[str],
+    cwd: Path,
+    timeout_seconds: float,
+    env: dict[str, str] | None = None,
+    stdout_limit_bytes: int = OUTPUT_LIMIT_BYTES,
+    stderr_limit_bytes: int = OUTPUT_LIMIT_BYTES,
+    deadline: float | None = None,
+) -> ProcessResult:
     if not argv:
         raise ValueError('argv must not be empty')
-    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+    if (
+        type(timeout_seconds) not in (int, float)
+        or not math.isfinite(timeout_seconds)
+        or timeout_seconds <= 0
+    ):
         raise ValueError('timeout_seconds must be finite and > 0')
+    for name, limit in (
+        ('stdout_limit_bytes', stdout_limit_bytes),
+        ('stderr_limit_bytes', stderr_limit_bytes),
+    ):
+        if type(limit) is not int or limit <= 0:
+            raise ValueError(f'{name} must be a positive integer')
+    if deadline is not None and (
+        type(deadline) not in (int, float) or not math.isfinite(deadline) or deadline <= 0
+    ):
+        raise ValueError('deadline must be a finite positive monotonic timestamp')
     started = time.monotonic()
+    execution_deadline = started + timeout_seconds
+    if deadline is not None:
+        execution_deadline = min(
+            execution_deadline,
+            deadline - PROCESS_CLEANUP_RESERVE_SECONDS,
+        )
     command = list(argv)
     stdout_capture, stderr_capture = _Capture(), _Capture()
+    stdout_capture.output_limit_bytes = stdout_limit_bytes
+    stderr_capture.output_limit_bytes = stderr_limit_bytes
+    if deadline is not None and time.monotonic() >= execution_deadline:
+        return ProcessResult(
+            argv=command,
+            exit_code=None,
+            stdout='',
+            stderr='',
+            timed_out=True,
+            elapsed_seconds=max(0.0, time.monotonic() - started),
+            started=False,
+            output_complete=False,
+        )
     try:
-        process = subprocess.Popen(command, cwd=cwd, stdout=subprocess.PIPE,
-                                   stderr=subprocess.PIPE)
+        process = subprocess.Popen(
+            command,
+            cwd=cwd,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
     except OSError as exc:
         return ProcessResult(argv=command, exit_code=None, stdout='', stderr='',
                              timed_out=False, elapsed_seconds=time.monotonic() - started,
@@ -157,9 +248,8 @@ def run_process(*, argv: Sequence[str], cwd: Path, timeout_seconds: float) -> Pr
     try:
         stdout_capture.start(process.stdout)
         stderr_capture.start(process.stderr)
-        deadline = started + timeout_seconds
         while True:
-            remaining = deadline - time.monotonic()
+            remaining = execution_deadline - time.monotonic()
             if remaining <= 0:
                 timed_out = True
                 break
@@ -167,7 +257,7 @@ def run_process(*, argv: Sequence[str], cwd: Path, timeout_seconds: float) -> Pr
                 break
             process_exited = process.poll() is not None
             output_complete = stdout_capture.done.is_set() and stderr_capture.done.is_set()
-            remaining = deadline - time.monotonic()
+            remaining = execution_deadline - time.monotonic()
             if remaining <= 0:
                 timed_out = True
                 break
@@ -180,7 +270,10 @@ def run_process(*, argv: Sequence[str], cwd: Path, timeout_seconds: float) -> Pr
         if timed_out or failure or stdout_capture.error or stderr_capture.error:
             cleanup_attempted = True
             try:
-                cleanup = _kill_process_tree(process.pid)
+                if deadline is None:
+                    cleanup = _kill_process_tree(process.pid)
+                else:
+                    cleanup = _kill_process_tree_before_deadline(process.pid, deadline)
                 if cleanup is None:
                     cleanup = CleanupResult(errors=['cleanup-result-unavailable'])
             except BaseException as exc:
@@ -190,6 +283,8 @@ def run_process(*, argv: Sequence[str], cwd: Path, timeout_seconds: float) -> Pr
             # One shared drain budget; no communicate()/wait() or synchronous
             # stream close can wait indefinitely behind a surviving writer.
             drain_deadline = time.monotonic() + DRAIN_SECONDS
+            if deadline is not None:
+                drain_deadline = min(drain_deadline, deadline)
             for capture in (stdout_capture, stderr_capture):
                 try:
                     capture.done.wait(max(0, drain_deadline - time.monotonic()))

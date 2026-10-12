@@ -18,7 +18,16 @@ from .models import (
 )
 from .orchestrator import TaskRunResult, run_task
 from .worker import QwenWorker, WorkerRunResult
-from .git import GitBaseline, GitEvidence
+from .git import (
+    GIT_PATCH_STDOUT_LIMIT_BYTES,
+    GIT_STDERR_LIMIT_BYTES,
+    GIT_STDOUT_LIMIT_BYTES,
+    GitBaseline,
+    GitEvidence,
+    GitFailureMetadata,
+    _GIT_FAILURE_REASONS,
+    _GIT_FAILURE_STAGES,
+)
 from .process import ProcessResult
 from .verifier import VerificationResult
 
@@ -223,6 +232,32 @@ def _git_summary(evidence) -> dict:
     return result
 
 
+def _git_failure_summary(metadata: object) -> dict:
+    if not isinstance(metadata, GitFailureMetadata):
+        return {}
+    result = {}
+    if type(metadata.reason) is str and metadata.reason in _GIT_FAILURE_REASONS:
+        result["reason"] = metadata.reason
+    if type(metadata.stage) is str and metadata.stage in _GIT_FAILURE_STAGES:
+        result["stage"] = metadata.stage
+    if type(metadata.exit_code) is int and -255 <= metadata.exit_code <= 255:
+        result["exit_code"] = metadata.exit_code
+    stdout_limits = {GIT_STDOUT_LIMIT_BYTES, GIT_PATCH_STDOUT_LIMIT_BYTES}
+    if type(metadata.stdout_limit_bytes) is int and metadata.stdout_limit_bytes in stdout_limits:
+        result["stdout_limit_bytes"] = metadata.stdout_limit_bytes
+    if type(metadata.stderr_limit_bytes) is int and metadata.stderr_limit_bytes == GIT_STDERR_LIMIT_BYTES:
+        result["stderr_limit_bytes"] = metadata.stderr_limit_bytes
+    for name in ("stdout_truncated", "stderr_truncated"):
+        value = getattr(metadata, name)
+        if type(value) is bool:
+            result[name] = value
+    for name in ("cleanup_error_count", "surviving_process_count"):
+        value = getattr(metadata, name)
+        if type(value) is int and 0 <= value <= 1_000_000:
+            result[name] = value
+    return result
+
+
 def _failure_record_summary(record: dict) -> dict:
     """Project named native observations; unknown fields and text stay private."""
     result = {}
@@ -234,6 +269,11 @@ def _failure_record_summary(record: dict) -> dict:
     for key in ("baseline", "git_evidence", "partial_git_evidence"):
         if key in record:
             result[key] = _git_summary(record[key])
+    for key in ("git_failure", "git_cleanup_failure"):
+        if key in record:
+            summary = _git_failure_summary(record[key])
+            if summary:
+                result[key] = summary
     verification = record.get("verification")
     if isinstance(verification, VerificationResult):
         result["verification"] = {
@@ -255,6 +295,10 @@ def _print_failure_evidence(exc: BaseException, *, stage: str = "unknown",
         stage = observed_stage if type(observed_stage) is str and observed_stage in _FAILURE_STAGES else "unknown"
         attempts = evidence.get("attempts")
         summary = _failure_record_summary(evidence)
+        for key in ("git_failure", "git_cleanup_failure"):
+            metadata = _git_failure_summary(getattr(exc, key, None))
+            if metadata:
+                summary[key] = metadata
         if type(attempts) is list:
             summary["attempts"] = [_failure_record_summary(a) if type(a) is dict else {}
                                    for a in attempts]

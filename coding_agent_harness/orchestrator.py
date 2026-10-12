@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal, Protocol, Sequence
 
-from .git import capture_baseline, capture_evidence
+from .git import GitFailureMetadata, capture_baseline, capture_evidence
 from .models import (
     StrictModel,
     TaskPacket,
@@ -72,6 +72,10 @@ def run_task(
             context["failed_process"] = exc.process_result
         if hasattr(exc, "git_evidence"):
             context["partial_git_evidence"] = exc.git_evidence
+        if isinstance(getattr(exc, "git_failure", None), GitFailureMetadata):
+            context["git_failure"] = exc.git_failure
+        if isinstance(getattr(exc, "git_cleanup_failure", None), GitFailureMetadata):
+            context["git_cleanup_failure"] = exc.git_cleanup_failure
         exc.harness_evidence = context
         raise
 

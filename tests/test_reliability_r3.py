@@ -828,6 +828,40 @@ def test_late_worker_completion_cannot_authorize_controller_followup(tmp_path, m
     worker = CountingQwenWorker()
     reviewer = ChosenReviewer(decision)
 
+    # Git evidence now uses the shared process runner, which this test replaces
+    # with a controlled late-child fake. Keep this test focused on the worker
+    # deadline by providing complete, deterministic Git observations.
+    import coding_agent_harness.git as git_module
+    monkeypatch.setattr(
+        controller_module,
+        'capture_baseline',
+        lambda repo_dir: git_module.GitBaseline(commit='a' * 40, status=''),
+    )
+    monkeypatch.setattr(
+        controller_module,
+        'capture_worktree_snapshot',
+        lambda repo_dir: git_module.GitWorktreeSnapshot(tree='b' * 40),
+    )
+    monkeypatch.setattr(
+        controller_module,
+        'capture_evidence',
+        lambda **kwargs: git_module.GitEvidence(
+            baseline_commit='a' * 40,
+            final_head='a' * 40,
+            final_status='',
+            changed_files=[],
+            patch='',
+            commits=[],
+        ),
+    )
+    monkeypatch.setattr(
+        controller_module,
+        'capture_attempt_evidence',
+        lambda *, repo, before: git_module.GitAttemptEvidence(
+            before_tree=before.tree, after_tree=before.tree, changed_files=[],
+        ),
+    )
+
     result = HarnessController(
         worker=worker,
         reviewer=reviewer,
