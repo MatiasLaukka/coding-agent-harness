@@ -203,11 +203,22 @@ def _parse_completion(
             ),
         )
 
-    raw = records[-1]
+    if len(records) != 1:
+        return None, "multiple HARNESS_RESULT completion records"
+
+    raw = records[0]
+
+    def unique_keys(pairs):
+        payload = {}
+        for key, value in pairs:
+            if key in payload:
+                raise ValueError("duplicate HARNESS_RESULT JSON key")
+            payload[key] = value
+        return payload
 
     try:
         payload = json.loads(
-            raw
+            raw, object_pairs_hook=unique_keys,
         )
     except json.JSONDecodeError as exc:
         return (
@@ -217,6 +228,9 @@ def _parse_completion(
                 f"{exc.msg}"
             ),
         )
+
+    except ValueError:
+        return None, "duplicate HARNESS_RESULT JSON key"
 
     try:
         completion = (

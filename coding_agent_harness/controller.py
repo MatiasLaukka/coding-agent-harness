@@ -100,9 +100,9 @@ class HarnessController:
         reviewer,
         max_remediation_attempts: int = 2,
     ):
-        if max_remediation_attempts < 0:
+        if type(max_remediation_attempts) is not int or max_remediation_attempts < 0:
             raise ValueError(
-                "max_remediation_attempts must be >= 0"
+                "max_remediation_attempts must be a nonnegative integer"
             )
 
         self.worker = worker
@@ -268,6 +268,15 @@ class HarnessController:
                     verification=verification,
                     attempt=attempt,
                 )
+            )
+
+            # Annotations do not validate plugin output; Pydantic instances can
+            # also be mutated or constructed without validation. Rebuild from
+            # data before any acceptance or retry branch is authorized.
+            if not isinstance(decision, ReviewDecision):
+                raise ValueError("reviewer must return a valid ReviewDecision")
+            decision = ReviewDecision.model_validate(
+                decision.model_dump(mode="python", warnings=False), strict=True,
             )
 
             if decision.decision == "accept":
