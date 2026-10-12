@@ -624,3 +624,250 @@ def test_loaded_handoff_rejects_infrastructure_retry_provenance(tmp_path, case):
     callback.pop('worker_infrastructure_failed')
     with pytest.raises(ValidationError):
         HandoffSummary.model_validate(payload)
+
+
+def install_controlled_process(
+    monkeypatch,
+    *,
+    completion_after=0.12,
+    monitor_sleep_advance=0.4,
+    advance_on_first_poll=0,
+):
+    """Install a finite fake child and a clock that advances without wall time."""
+    from types import SimpleNamespace
+
+    class Clock:
+        def __init__(self):
+            self.now = 0.0
+            self.sleeps = []
+
+        def monotonic(self):
+            return self.now
+
+        def sleep(self, seconds):
+            self.sleeps.append(seconds)
+            self.now += monitor_sleep_advance
+
+    clock = Clock()
+
+    class Pipe:
+        def __init__(self, text):
+            self.text = text
+
+    completion = (
+        'HARNESS_RESULT: '
+        '{"status":"completed","summary":"Finished late",'
+        '"changed_files":[],"remaining_concerns":[]}\n'
+    )
+
+    class Child:
+        pid = 424242
+
+        def __init__(self):
+            self.completed = False
+            self.poll_count = 0
+            self.stdout = Pipe(completion)
+            self.stderr = Pipe('captured stderr\n')
+
+        def poll(self):
+            if self.poll_count == 0:
+                clock.now += advance_on_first_poll
+            self.poll_count += 1
+            if clock.now >= completion_after:
+                self.completed = True
+            return 0 if self.completed else None
+
+    child = Child()
+
+    class Done:
+        def is_set(self):
+            return child.completed
+
+        def wait(self, timeout=None):
+            return child.completed
+
+    class Stop:
+        def set(self):
+            pass
+
+    class Capture:
+        def __init__(self):
+            self.done = Done()
+            self.stop = Stop()
+            self.error = None
+            self.truncated = False
+            self.thread = None
+            self.stream = None
+
+        @property
+        def eof(self):
+            return child.completed
+
+        def start(self, stream):
+            self.stream = stream
+            self.thread = object()
+
+        def snapshot(self):
+            return self.stream.text
+
+    launches = []
+
+    def launch(*args, **kwargs):
+        launches.append((args, kwargs))
+        return child
+
+    cleanup_calls = []
+    monkeypatch.setattr(
+        process_module,
+        'time',
+        SimpleNamespace(monotonic=clock.monotonic, sleep=clock.sleep),
+    )
+    monkeypatch.setattr(
+        process_module,
+        'subprocess',
+        SimpleNamespace(Popen=launch, PIPE=object()),
+    )
+    monkeypatch.setattr(process_module, '_Capture', Capture)
+    monkeypatch.setattr(
+        process_module,
+        '_kill_process_tree',
+        lambda pid: (cleanup_calls.append(pid) or process_module.CleanupResult()),
+    )
+    return child, clock, launches, cleanup_calls
+
+
+def test_delayed_monitor_classifies_late_child_completion_as_timeout(tmp_path, monkeypatch):
+    child, clock, _, cleanup_calls = install_controlled_process(monkeypatch)
+
+    result = run_process(argv=['controlled-child'], cwd=tmp_path, timeout_seconds=0.05)
+
+    assert clock.now == pytest.approx(0.4)
+    assert result.elapsed_seconds > 0.05
+    assert result.timed_out is True
+    assert result.infrastructure_failed is True
+    assert result.exit_code == 0
+    assert result.stdout.startswith('HARNESS_RESULT: ')
+    assert result.stderr == 'captured stderr\n'
+    assert result.output_complete is True
+    assert result.stdout_truncated is False
+    assert result.stderr_truncated is False
+    assert result.cleanup_attempted is True
+    assert cleanup_calls == [child.pid]
+
+
+def test_monitor_rechecks_deadline_after_completion_observations(tmp_path, monkeypatch):
+    child, clock, _, cleanup_calls = install_controlled_process(
+        monkeypatch,
+        completion_after=0,
+        monitor_sleep_advance=0.01,
+        advance_on_first_poll=0.06,
+    )
+
+    result = run_process(argv=['controlled-child'], cwd=tmp_path, timeout_seconds=0.05)
+
+    assert clock.now == pytest.approx(0.06)
+    assert result.timed_out is True
+    assert result.exit_code == 0
+    assert result.output_complete is True
+    assert result.cleanup_attempted is True
+    assert cleanup_calls == [child.pid]
+
+
+def test_safe_completion_within_budget_skips_cleanup(tmp_path, monkeypatch):
+    child, clock, _, cleanup_calls = install_controlled_process(
+        monkeypatch,
+        completion_after=0.01,
+        monitor_sleep_advance=0.01,
+    )
+
+    result = run_process(argv=['controlled-child'], cwd=tmp_path, timeout_seconds=0.05)
+
+    assert clock.now == pytest.approx(0.01)
+    assert result.timed_out is False
+    assert result.exit_code == 0
+    assert result.output_complete is True
+    assert result.cleanup_attempted is False
+    assert cleanup_calls == []
+    assert child.completed is True
+
+
+@pytest.mark.parametrize('action', ['accept', 'remediate', 'revise-scope'])
+def test_late_worker_completion_cannot_authorize_controller_followup(tmp_path, monkeypatch, action):
+    repo = make_repo(tmp_path)
+    child, _, launches, _ = install_controlled_process(monkeypatch)
+
+    class CountingQwenWorker(QwenWorker):
+        def __init__(self):
+            super().__init__(command=['offline-child'], model='offline', timeout_seconds=0.05)
+            self.calls = 0
+
+        def run(self, **kwargs):
+            self.calls += 1
+            return super().run(**kwargs)
+
+    class ChosenReviewer:
+        def __init__(self, decision):
+            self.decision = decision
+            self.calls = 0
+            self.observed = None
+
+        def review(self, **kwargs):
+            self.calls += 1
+            self.observed = kwargs
+            return self.decision
+
+    decision = {
+        'accept': ReviewDecision(decision='accept', rationale='Accept the completion'),
+        'remediate': ReviewDecision(
+            decision='remediate', rationale='Try again', remediation='Run again',
+        ),
+        'revise-scope': ReviewDecision(
+            decision='revise-scope', rationale='Broaden scope', revised_allowed_files=['safe.py'],
+        ),
+    }[action]
+    worker = CountingQwenWorker()
+    reviewer = ChosenReviewer(decision)
+
+    result = HarnessController(
+        worker=worker,
+        reviewer=reviewer,
+        max_remediation_attempts=2,
+    ).run(task=task(), repo_dir=repo, verification_commands=[])
+
+    assert result.status == 'worker-failure'
+    assert result.attempts == 1
+    assert worker.calls == 1
+    assert len(launches) == 1
+    assert reviewer.calls == 1
+    assert reviewer.observed['worker_assessment'].outcome == 'execution-failure'
+    assert reviewer.observed['worker_result'].completion.status == 'completed'
+    assert reviewer.observed['worker_result'].process.timed_out is True
+    assert reviewer.observed['worker_result'].process.exit_code == 0
+    assert child.completed is True
+
+
+@pytest.mark.parametrize('expectation', ['must_pass', 'expected_failure', 'advisory'])
+def test_late_verification_completion_is_never_reported_as_passing(tmp_path, monkeypatch, expectation):
+    install_controlled_process(monkeypatch, completion_after=1.2, monitor_sleep_advance=1.4)
+    reason = 'Expected local command failure' if expectation == 'expected_failure' else None
+
+    result = run_verification(
+        repo_dir=tmp_path,
+        commands=[VerificationCommand(
+            id='late',
+            argv=['controlled-child'],
+            timeout_seconds=1,
+            expectation=expectation,
+            expectation_reason=reason,
+        )],
+    )
+
+    check = result.checks[0]
+    assert result.passed is False
+    assert check.passed is False
+    assert check.timed_out is True
+    assert check.infrastructure_failed is True
+    assert check.exit_code == 0
+    assert check.stdout.startswith('HARNESS_RESULT: ')
+    if expectation != 'advisory':
+        assert check.expectation_met is False
