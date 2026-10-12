@@ -159,13 +159,19 @@ def run_process(*, argv: Sequence[str], cwd: Path, timeout_seconds: float) -> Pr
         stderr_capture.start(process.stderr)
         deadline = started + timeout_seconds
         while True:
-            if stdout_capture.error or stderr_capture.error:
-                break
-            if process.poll() is not None and stdout_capture.done.is_set() and stderr_capture.done.is_set():
-                break
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 timed_out = True
+                break
+            if stdout_capture.error or stderr_capture.error:
+                break
+            process_exited = process.poll() is not None
+            output_complete = stdout_capture.done.is_set() and stderr_capture.done.is_set()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+            if process_exited and output_complete:
                 break
             time.sleep(min(0.01, remaining))
     except BaseException as exc:
