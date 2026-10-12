@@ -120,7 +120,27 @@ class HarnessController:
             VerificationCommand
         ],
     ) -> HarnessRunResult:
+        context = {"attempts": [], "stage": "baseline"}
+        try:
+            return self._run(task=task, repo_dir=repo_dir,
+                             verification_commands=verification_commands, context=context)
+        except BaseException as exc:
+            context["failure_type"] = type(exc).__name__
+            if context["attempts"]:
+                record = context["attempts"][-1]
+                if hasattr(exc, "verification_result"):
+                    record["verification"] = exc.verification_result
+                    record["failed_command"] = exc.failed_command
+                if hasattr(exc, "process_result"):
+                    record["failed_process"] = exc.process_result
+            if hasattr(exc, "git_evidence"):
+                context["partial_git_evidence"] = exc.git_evidence
+            exc.harness_evidence = context
+            raise
+
+    def _run(self, *, task, repo_dir, verification_commands, context) -> HarnessRunResult:
         baseline = capture_baseline(repo_dir)
+        context["baseline"] = baseline
 
         original_task = task
         current_task = task
@@ -129,31 +149,45 @@ class HarnessController:
         remediation_count = 0
         scope_revision_count = 0
         audit_events: list[AuditEvent] = []
+        context["audit_events"] = audit_events
 
         while True:
+            record = {"attempt": attempt, "task": current_task}
+            context["attempts"].append(record)
+            context["stage"] = "attempt-snapshot"
             attempt_snapshot = capture_worktree_snapshot(
                 repo_dir
             )
 
+            record["snapshot"] = attempt_snapshot
+            context["stage"] = "worker"
             worker_result = self.worker.run(
                 task=current_task,
                 repo_dir=repo_dir,
             )
 
+            record["worker_result"] = worker_result
+            context["stage"] = "worker-classification"
             worker_assessment = classify_worker_run(
                 worker_result
             )
 
+            record["worker_assessment"] = worker_assessment
+            context["stage"] = "git-evidence"
             evidence = capture_evidence(
                 repo=repo_dir,
                 baseline=baseline,
             )
 
+            record["git_evidence"] = evidence
+            context["stage"] = "attempt-evidence"
             attempt_evidence = capture_attempt_evidence(
                 repo=repo_dir,
                 before=attempt_snapshot,
             )
 
+            record["attempt_evidence"] = attempt_evidence
+            context["stage"] = "scope-assessment"
             completion = getattr(
                 worker_result,
                 "completion",
@@ -237,11 +271,14 @@ class HarnessController:
                         )
                     )
 
+            context["stage"] = "verification"
             verification = run_verification(
                 repo_dir=repo_dir,
                 commands=verification_commands,
             )
 
+            record["verification"] = verification
+            context["stage"] = "verification-assessment"
             for check in verification.checks:
                 if check.expectation_met is False:
                     audit_events.append(
@@ -259,6 +296,7 @@ class HarnessController:
                         )
                     )
 
+            context["stage"] = "review"
             decision: ReviewDecision = (
                 self.reviewer.review(
                     task=current_task,
@@ -270,6 +308,7 @@ class HarnessController:
                 )
             )
 
+            context["stage"] = "review-validation"
             # Annotations do not validate plugin output; Pydantic instances can
             # also be mutated or constructed without validation. Rebuild from
             # data before any acceptance or retry branch is authorized.
@@ -278,6 +317,9 @@ class HarnessController:
             decision = ReviewDecision.model_validate(
                 decision.model_dump(mode="python", warnings=False), strict=True,
             )
+
+            record["decision"] = decision
+            context["stage"] = "result-or-retry"
 
             if decision.decision == "accept":
                 if worker_assessment.outcome in {
@@ -334,6 +376,13 @@ class HarnessController:
                     attempts=attempt,
                     audit_events=audit_events,
                 )
+
+            if worker_result.process.infrastructure_failed:
+                return HarnessRunResult(status="worker-failure", attempts=attempt,
+                                        audit_events=audit_events)
+            if any(check.infrastructure_failed for check in verification.checks):
+                return HarnessRunResult(status="verification-failure", attempts=attempt,
+                                        audit_events=audit_events)
 
             if (
                 retry_count

@@ -16,3 +16,6 @@ htmlcov/
 build/
 dist/
 .coverage.*
+
+# Local R3 reproduction exports and temporary test workspaces
+.r3-evidence/

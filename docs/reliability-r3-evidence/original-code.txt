@@ -1,0 +1,237 @@
+FFFFFFFFFFFFFFFFFFFFFFFFFFF                                              [100%]
+================================== FAILURES ===================================
+____________ test_parent_exit_with_inherited_pipes_obeys_deadline _____________
+tests\test_reliability_r3.py:66: in test_parent_exit_with_inherited_pipes_obeys_deadline
+    assert result['elapsed_seconds'] < 2.5
+E   assert 4.375 < 2.5
+__________ test_failed_tree_termination_does_not_wait_for_child_exit __________
+tests\test_reliability_r3.py:89: in test_failed_tree_termination_does_not_wait_for_child_exit
+    assert result['elapsed_seconds'] < 2.5
+E   assert 4.108999999938533 < 2.5
+____________ test_large_output_is_bounded_with_truncation_evidence ____________
+tests\test_reliability_r3.py:105: in test_large_output_is_bounded_with_truncation_evidence
+    assert len(result['stdout'].encode()) <= 1024 * 1024
+E   AssertionError: assert 2097152 <= (1024 * 1024)
+E    +  where 2097152 = len(b'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx...xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx')
+E    +    where b'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx...xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx' = <built-in method encode of str object at 0x00000156858FA040>()
+E    +      where <built-in method encode of str object at 0x00000156858FA040> = 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx...xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'.encode
+____________ test_launch_failure_is_structured_execution_evidence _____________
+tests\test_reliability_r3.py:113: in test_launch_failure_is_structured_execution_evidence
+    result = run_process(argv=argv, cwd=tmp_path, timeout_seconds=1)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+.r3-evidence\original\coding_agent_harness\process.py:92: in run_process
+    process = subprocess.Popen(
+C:\Users\matia\AppData\Local\Programs\Python\Python312\Lib\subprocess.py:1026: in __init__
+    self._execute_child(args, executable, preexec_fn, close_fds,
+C:\Users\matia\AppData\Local\Programs\Python\Python312\Lib\subprocess.py:1538: in _execute_child
+    hp, ht, pid, tid = _winapi.CreateProcess(executable, args,
+E   FileNotFoundError: [WinError 2] The system cannot find the file specified
+_______ test_late_launch_failure_preserves_completed_checks[must_pass] ________
+tests\test_reliability_r3.py:124: in test_late_launch_failure_preserves_completed_checks
+    result = run_verification(repo_dir=tmp_path, commands=[
+.r3-evidence\original\coding_agent_harness\verifier.py:112: in run_verification
+    process = run_process(
+.r3-evidence\original\coding_agent_harness\process.py:92: in run_process
+    process = subprocess.Popen(
+C:\Users\matia\AppData\Local\Programs\Python\Python312\Lib\subprocess.py:1026: in __init__
+    self._execute_child(args, executable, preexec_fn, close_fds,
+C:\Users\matia\AppData\Local\Programs\Python\Python312\Lib\subprocess.py:1538: in _execute_child
+    hp, ht, pid, tid = _winapi.CreateProcess(executable, args,
+E   FileNotFoundError: [WinError 2] The system cannot find the file specified
+____ test_late_launch_failure_preserves_completed_checks[expected_failure] ____
+tests\test_reliability_r3.py:124: in test_late_launch_failure_preserves_completed_checks
+    result = run_verification(repo_dir=tmp_path, commands=[
+.r3-evidence\original\coding_agent_harness\verifier.py:112: in run_verification
+    process = run_process(
+.r3-evidence\original\coding_agent_harness\process.py:92: in run_process
+    process = subprocess.Popen(
+C:\Users\matia\AppData\Local\Programs\Python\Python312\Lib\subprocess.py:1026: in __init__
+    self._execute_child(args, executable, preexec_fn, close_fds,
+C:\Users\matia\AppData\Local\Programs\Python\Python312\Lib\subprocess.py:1538: in _execute_child
+    hp, ht, pid, tid = _winapi.CreateProcess(executable, args,
+E   FileNotFoundError: [WinError 2] The system cannot find the file specified
+________ test_late_launch_failure_preserves_completed_checks[advisory] ________
+tests\test_reliability_r3.py:124: in test_late_launch_failure_preserves_completed_checks
+    result = run_verification(repo_dir=tmp_path, commands=[
+.r3-evidence\original\coding_agent_harness\verifier.py:112: in run_verification
+    process = run_process(
+.r3-evidence\original\coding_agent_harness\process.py:92: in run_process
+    process = subprocess.Popen(
+C:\Users\matia\AppData\Local\Programs\Python\Python312\Lib\subprocess.py:1026: in __init__
+    self._execute_child(args, executable, preexec_fn, close_fds,
+C:\Users\matia\AppData\Local\Programs\Python\Python312\Lib\subprocess.py:1538: in _execute_child
+    hp, ht, pid, tid = _winapi.CreateProcess(executable, args,
+E   FileNotFoundError: [WinError 2] The system cannot find the file specified
+____ test_verification_interruption_keeps_prior_observations[RuntimeError] ____
+tests\test_reliability_r3.py:150: in test_verification_interruption_keeps_prior_observations
+    observations = caught.value.verification_result
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   AttributeError: 'RuntimeError' object has no attribute 'verification_result'
+_ test_verification_interruption_keeps_prior_observations[KeyboardInterrupt] __
+tests\test_reliability_r3.py:150: in test_verification_interruption_keeps_prior_observations
+    observations = caught.value.verification_result
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   AttributeError: 'KeyboardInterrupt' object has no attribute 'verification_result'
+_ test_controller_failure_keeps_completed_evidence[RuntimeError-capture_evidence] _
+tests\test_reliability_r3.py:172: in test_controller_failure_keeps_completed_evidence
+    preserved = caught.value.harness_evidence
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   AttributeError: 'RuntimeError' object has no attribute 'harness_evidence'
+_ test_controller_failure_keeps_completed_evidence[RuntimeError-capture_attempt_evidence] _
+tests\test_reliability_r3.py:172: in test_controller_failure_keeps_completed_evidence
+    preserved = caught.value.harness_evidence
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   AttributeError: 'RuntimeError' object has no attribute 'harness_evidence'
+_ test_controller_failure_keeps_completed_evidence[RuntimeError-run_verification] _
+tests\test_reliability_r3.py:172: in test_controller_failure_keeps_completed_evidence
+    preserved = caught.value.harness_evidence
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   AttributeError: 'RuntimeError' object has no attribute 'harness_evidence'
+____ test_controller_failure_keeps_completed_evidence[RuntimeError-review] ____
+tests\test_reliability_r3.py:172: in test_controller_failure_keeps_completed_evidence
+    preserved = caught.value.harness_evidence
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   AttributeError: 'RuntimeError' object has no attribute 'harness_evidence'
+_ test_controller_failure_keeps_completed_evidence[KeyboardInterrupt-capture_evidence] _
+tests\test_reliability_r3.py:172: in test_controller_failure_keeps_completed_evidence
+    preserved = caught.value.harness_evidence
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   AttributeError: 'KeyboardInterrupt' object has no attribute 'harness_evidence'
+_ test_controller_failure_keeps_completed_evidence[KeyboardInterrupt-capture_attempt_evidence] _
+tests\test_reliability_r3.py:172: in test_controller_failure_keeps_completed_evidence
+    preserved = caught.value.harness_evidence
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   AttributeError: 'KeyboardInterrupt' object has no attribute 'harness_evidence'
+_ test_controller_failure_keeps_completed_evidence[KeyboardInterrupt-run_verification] _
+tests\test_reliability_r3.py:172: in test_controller_failure_keeps_completed_evidence
+    preserved = caught.value.harness_evidence
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   AttributeError: 'KeyboardInterrupt' object has no attribute 'harness_evidence'
+_ test_controller_failure_keeps_completed_evidence[KeyboardInterrupt-review] __
+tests\test_reliability_r3.py:172: in test_controller_failure_keeps_completed_evidence
+    preserved = caught.value.harness_evidence
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   AttributeError: 'KeyboardInterrupt' object has no attribute 'harness_evidence'
+_______________ test_timeout_never_authorizes_remediation_retry _______________
+tests\test_reliability_r3.py:194: in test_timeout_never_authorizes_remediation_retry
+    assert result.status == 'worker-failure'
+E   AssertionError: assert 'stopped' == 'worker-failure'
+E
+E     - worker-failure
+E     + stopped
+______ test_cancellation_preserves_process_evidence_and_attempts_cleanup ______
+tests\test_reliability_r3.py:198: in test_cancellation_preserves_process_evidence_and_attempts_cleanup
+    result = isolated_probe(tmp_path, f'''
+tests\test_reliability_r3.py:33: in isolated_probe
+    return json.loads(stdout)
+           ^^^^^^^^^^^^^^^^^^
+C:\Users\matia\AppData\Local\Programs\Python\Python312\Lib\json\__init__.py:346: in loads
+    return _default_decoder.decode(s)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+C:\Users\matia\AppData\Local\Programs\Python\Python312\Lib\json\decoder.py:338: in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+C:\Users\matia\AppData\Local\Programs\Python\Python312\Lib\json\decoder.py:356: in raw_decode
+    raise JSONDecodeError("Expecting value", s, err.value) from None
+E   json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+____________ test_termination_denial_reports_errors_and_survivors _____________
+tests\test_reliability_r3.py:239: in test_termination_denial_reports_errors_and_survivors
+    assert result is not None
+E   assert None is not None
+__________ test_output_capture_error_keeps_available_output_and_exit __________
+tests\test_reliability_r3.py:276: in test_output_capture_error_keeps_available_output_and_exit
+    assert 'available' in result['stdout']
+E   AssertionError: assert 'available' in ''
+____________ test_single_run_failure_keeps_worker_and_git_evidence ____________
+tests\test_reliability_r3.py:290: in test_single_run_failure_keeps_worker_and_git_evidence
+    preserved = caught.value.harness_evidence
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   AttributeError: 'RuntimeError' object has no attribute 'harness_evidence'
+_____________ test_truncated_worker_completion_cannot_be_accepted _____________
+tests\test_reliability_r3.py:296: in test_truncated_worker_completion_cannot_be_accepted
+    result = isolated_probe(tmp_path, f"""
+tests\test_reliability_r3.py:32: in isolated_probe
+    assert runner.returncode == 0, stderr
+E   AssertionError: Traceback (most recent call last):
+E       File "D:\Documents\coding-agent-harness-reliability-r3\.r3-evidence\confirmed-red-temp\test_truncated_worker_completi0\probe.py", line 10, in <module>
+E         print(json.dumps({'truncated': r.process.stdout_truncated, 'completion': r.completion.model_dump() if r.completion else None, 'outcome': classify_worker_run(r).outcome}))
+E                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       File "D:\Documents\coding-agent-harness-public\.venv\Lib\site-packages\pydantic\main.py", line 1105, in __getattr__
+E         raise AttributeError(f'{type(self).__name__!r} object has no attribute {item!r}')
+E     AttributeError: 'ProcessResult' object has no attribute 'stdout_truncated'
+E
+E   assert 1 == 0
+E    +  where 1 = <Popen: returncode: 1 args: ['D:\\Documents\\coding-agent-harness-public\\.v...>.returncode
+_____ test_later_attempt_exception_retains_prior_successful_observations ______
+tests\test_reliability_r3.py:346: in test_later_attempt_exception_retains_prior_successful_observations
+    attempts = caught.value.harness_evidence['attempts']
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   AttributeError: 'RuntimeError' object has no attribute 'harness_evidence'
+_________ test_result_construction_error_keeps_completed_observations _________
+tests\test_reliability_r3.py:365: in test_result_construction_error_keeps_completed_observations
+    record = caught.value.harness_evidence['attempts'][0]
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   AttributeError: 'RuntimeError' object has no attribute 'harness_evidence'
+____ test_error_immediately_after_launch_cleans_up_and_preserves_identity _____
+tests\test_reliability_r3.py:372: in test_error_immediately_after_launch_cleans_up_and_preserves_identity
+    result = isolated_probe(tmp_path, f'''
+tests\test_reliability_r3.py:32: in isolated_probe
+    assert runner.returncode == 0, stderr
+E   AssertionError: Traceback (most recent call last):
+E       File "D:\Documents\coding-agent-harness-reliability-r3\.r3-evidence\confirmed-red-temp\test_error_immediately_after_l0\probe.py", line 20, in <module>
+E         m.run_process(argv=[sys.executable, '-c', 'import time; time.sleep(4)'], cwd=Path('D:\\Documents\\coding-agent-harness-reliability-r3\\.r3-evidence\\confirmed-red-temp\\test_error_immediately_after_l0'), timeout_seconds=1)
+E       File "D:\Documents\coding-agent-harness-reliability-r3\.r3-evidence\original\coding_agent_harness\process.py", line 106, in run_process
+E         process.communicate(
+E       File "C:\Users\matia\AppData\Local\Programs\Python\Python312\Lib\subprocess.py", line 1209, in communicate
+E         stdout, stderr = self._communicate(input, endtime, timeout)
+E                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       File "C:\Users\matia\AppData\Local\Programs\Python\Python312\Lib\subprocess.py", line 1612, in _communicate
+E         self.stdout_thread.start()
+E       File "D:\Documents\coding-agent-harness-reliability-r3\.r3-evidence\confirmed-red-temp\test_error_immediately_after_l0\probe.py", line 16, in broken_start
+E         raise RuntimeError('reader startup failed')
+E     RuntimeError: reader startup failed
+E
+E     During handling of the above exception, another exception occurred:
+E
+E     Traceback (most recent call last):
+E       File "D:\Documents\coding-agent-harness-reliability-r3\.r3-evidence\confirmed-red-temp\test_error_immediately_after_l0\probe.py", line 22, in <module>
+E         print(json.dumps({'evidence': exc.process_result.model_dump(), 'alive': created[0].poll() is None}))
+E                                       ^^^^^^^^^^^^^^^^^^
+E     AttributeError: 'RuntimeError' object has no attribute 'process_result'
+E
+E   assert 1 == 0
+E    +  where 1 = <Popen: returncode: 1 args: ['D:\\Documents\\coding-agent-harness-public\\.v...>.returncode
+_____________ test_partial_git_capture_preserves_completed_fields _____________
+tests\test_reliability_r3.py:409: in test_partial_git_capture_preserves_completed_fields
+    partial = caught.value.git_evidence
+              ^^^^^^^^^^^^^^^^^^^^^^^^^
+E   AttributeError: 'OSError' object has no attribute 'git_evidence'
+=========================== short test summary info ===========================
+FAILED tests/test_reliability_r3.py::test_parent_exit_with_inherited_pipes_obeys_deadline
+FAILED tests/test_reliability_r3.py::test_failed_tree_termination_does_not_wait_for_child_exit
+FAILED tests/test_reliability_r3.py::test_large_output_is_bounded_with_truncation_evidence
+FAILED tests/test_reliability_r3.py::test_launch_failure_is_structured_execution_evidence
+FAILED tests/test_reliability_r3.py::test_late_launch_failure_preserves_completed_checks[must_pass]
+FAILED tests/test_reliability_r3.py::test_late_launch_failure_preserves_completed_checks[expected_failure]
+FAILED tests/test_reliability_r3.py::test_late_launch_failure_preserves_completed_checks[advisory]
+FAILED tests/test_reliability_r3.py::test_verification_interruption_keeps_prior_observations[RuntimeError]
+FAILED tests/test_reliability_r3.py::test_verification_interruption_keeps_prior_observations[KeyboardInterrupt]
+FAILED tests/test_reliability_r3.py::test_controller_failure_keeps_completed_evidence[RuntimeError-capture_evidence]
+FAILED tests/test_reliability_r3.py::test_controller_failure_keeps_completed_evidence[RuntimeError-capture_attempt_evidence]
+FAILED tests/test_reliability_r3.py::test_controller_failure_keeps_completed_evidence[RuntimeError-run_verification]
+FAILED tests/test_reliability_r3.py::test_controller_failure_keeps_completed_evidence[RuntimeError-review]
+FAILED tests/test_reliability_r3.py::test_controller_failure_keeps_completed_evidence[KeyboardInterrupt-capture_evidence]
+FAILED tests/test_reliability_r3.py::test_controller_failure_keeps_completed_evidence[KeyboardInterrupt-capture_attempt_evidence]
+FAILED tests/test_reliability_r3.py::test_controller_failure_keeps_completed_evidence[KeyboardInterrupt-run_verification]
+FAILED tests/test_reliability_r3.py::test_controller_failure_keeps_completed_evidence[KeyboardInterrupt-review]
+FAILED tests/test_reliability_r3.py::test_timeout_never_authorizes_remediation_retry
+FAILED tests/test_reliability_r3.py::test_cancellation_preserves_process_evidence_and_attempts_cleanup
+FAILED tests/test_reliability_r3.py::test_termination_denial_reports_errors_and_survivors
+FAILED tests/test_reliability_r3.py::test_output_capture_error_keeps_available_output_and_exit
+FAILED tests/test_reliability_r3.py::test_single_run_failure_keeps_worker_and_git_evidence
+FAILED tests/test_reliability_r3.py::test_truncated_worker_completion_cannot_be_accepted
+FAILED tests/test_reliability_r3.py::test_later_attempt_exception_retains_prior_successful_observations
+FAILED tests/test_reliability_r3.py::test_result_construction_error_keeps_completed_observations
+FAILED tests/test_reliability_r3.py::test_error_immediately_after_launch_cleans_up_and_preserves_identity
+FAILED tests/test_reliability_r3.py::test_partial_git_capture_preserves_completed_fields
+27 failed, 9 deselected in 38.73s

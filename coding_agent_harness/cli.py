@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from pathlib import Path
 from typing import Sequence
 
-from pydantic import Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
 from .models import (
     StrictModel,
@@ -148,6 +149,35 @@ def _print_result(
         print(
             "  (empty)"
         )
+
+
+def _print_failure_evidence(exc: BaseException) -> None:
+    """Expose completed observations without echoing command/prompt arguments."""
+    def serializable(value):
+        if isinstance(value, TaskPacket):
+            return {"task_id": value.task_id}
+        if isinstance(value, BaseModel):
+            return serializable(value.model_dump(mode="json"))
+        if isinstance(value, dict):
+            result = {}
+            for key, item in value.items():
+                if key == "argv":
+                    raw = json.dumps(item, ensure_ascii=False).encode("utf-8")
+                    result["argv_sha256"] = hashlib.sha256(raw).hexdigest()
+                else:
+                    result[key] = serializable(item)
+            return result
+        if isinstance(value, list):
+            return [serializable(item) for item in value]
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        return {"unavailable_type": type(value).__name__}
+
+    try:
+        evidence = getattr(exc, "harness_evidence", {"failure_type": type(exc).__name__})
+        print("Failure evidence: " + json.dumps(serializable(evidence), ensure_ascii=False), file=sys.stderr)
+    except Exception as capture_error:
+        print("Failure evidence unavailable: " + type(capture_error).__name__, file=sys.stderr)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -293,11 +323,16 @@ def app(
                 spec.verification_commands
             ),
         )
+    except KeyboardInterrupt as exc:
+        print("Harness run interrupted.", file=sys.stderr)
+        _print_failure_evidence(exc)
+        return 130
     except Exception as exc:
         print(
             f"Harness run failed: {exc}",
             file=sys.stderr,
         )
+        _print_failure_evidence(exc)
         return 1
 
     _print_result(
