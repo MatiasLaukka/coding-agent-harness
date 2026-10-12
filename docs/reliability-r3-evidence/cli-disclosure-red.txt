@@ -1,0 +1,69 @@
+FFFFFFFFF                                                                [100%]
+================================== FAILURES ===================================
+_ test_cli_failure_hides_content_but_preserves_python_evidence[RuntimeError-1-single] _
+tests\test_cli_failure_evidence.py:76: in test_cli_failure_hides_content_but_preserves_python_evidence
+    assert not leaked, 'raw content disclosed: ' + ', '.join(leaked)
+E   AssertionError: raw content disclosed: worker_stdout, worker_stderr, check_stdout, check_stderr, patch, exception, cleanup, task, arbitrary
+E   assert not ['worker_stdout', 'worker_stderr', 'check_stdout', 'check_stderr', 'patch', 'exception', ...]
+_ test_cli_failure_hides_content_but_preserves_python_evidence[RuntimeError-1-controller] _
+tests\test_cli_failure_evidence.py:76: in test_cli_failure_hides_content_but_preserves_python_evidence
+    assert not leaked, 'raw content disclosed: ' + ', '.join(leaked)
+E   AssertionError: raw content disclosed: worker_stdout, worker_stderr, check_stdout, check_stderr, patch, exception, cleanup, task, arbitrary
+E   assert not ['worker_stdout', 'worker_stderr', 'check_stdout', 'check_stderr', 'patch', 'exception', ...]
+_ test_cli_failure_hides_content_but_preserves_python_evidence[KeyboardInterrupt-130-single] _
+tests\test_cli_failure_evidence.py:76: in test_cli_failure_hides_content_but_preserves_python_evidence
+    assert not leaked, 'raw content disclosed: ' + ', '.join(leaked)
+E   AssertionError: raw content disclosed: worker_stdout, worker_stderr, check_stdout, check_stderr, patch, cleanup, task, arbitrary
+E   assert not ['worker_stdout', 'worker_stderr', 'check_stdout', 'check_stderr', 'patch', 'cleanup', ...]
+_ test_cli_failure_hides_content_but_preserves_python_evidence[KeyboardInterrupt-130-controller] _
+tests\test_cli_failure_evidence.py:76: in test_cli_failure_hides_content_but_preserves_python_evidence
+    assert not leaked, 'raw content disclosed: ' + ', '.join(leaked)
+E   AssertionError: raw content disclosed: worker_stdout, worker_stderr, check_stdout, check_stderr, patch, cleanup, task, arbitrary
+E   assert not ['worker_stdout', 'worker_stderr', 'check_stdout', 'check_stderr', 'patch', 'cleanup', ...]
+_ test_cli_input_and_setup_exceptions_do_not_echo_sensitive_messages[task-file] _
+tests\test_cli_failure_evidence.py:127: in test_cli_input_and_setup_exceptions_do_not_echo_sensitive_messages
+    assert MARKERS['exception'] not in stderr
+E   AssertionError: assert 'R3_FAKE_SEC...PTION_98c427' not in 'Task file e...tring_type\n'
+E
+E     'R3_FAKE_SECRET_EXCEPTION_98c427' is contained here:
+E       sitive': 'R3_FAKE_SECRET_EXCEPTION_98c427'}, input_type=dict]
+E           For further information visit https://errors.pydantic.dev/2.14/v/string_type
+_ test_cli_input_and_setup_exceptions_do_not_echo_sensitive_messages[worker-setup] _
+tests\test_cli_failure_evidence.py:127: in test_cli_input_and_setup_exceptions_do_not_echo_sensitive_messages
+    assert MARKERS['exception'] not in stderr
+E   assert 'R3_FAKE_SEC...PTION_98c427' not in 'Harness run...imeError"}\n'
+E
+E     'R3_FAKE_SECRET_EXCEPTION_98c427' is contained here:
+E       Harness run failed: R3_FAKE_SECRET_EXCEPTION_98c427
+E       Failure evidence: {"failure_type": "RuntimeError"}
+_____ test_cli_failure_allowlist_hides_unknown_labels_and_exception_type ______
+tests\test_cli_failure_evidence.py:144: in test_cli_failure_allowlist_hides_unknown_labels_and_exception_type
+    assert secret not in stderr and MARKERS['exception'] not in stderr
+E   assert ('R3_FAKE_SEC...TRARY_98c427' not in 'Failure evi..._98c427"}}\n'
+E
+E     'R3_FAKE_SECRET_ARBITRARY_98c427' is contained here:
+E     ?                            --------------------                                         ^^^^^^^^^^^^
+E       Failure evidence: {"stage": "R3_FAKE_SECRET_ARBITRARY_98c427", "failure_type": "R3_FAKE_SECRET_ARBITRARY_98c427", "failed_process": {"argv_sha256": "7fe7b8a7781bb107d316a146134bab8adfde30a57f3d85ebcf3f1423a8dc7518", "exit_code": null, "stdout": "R3_FAKE_SECRET_ARBITRARY_98c427", "stderr": "R3_FAKE_SECRET_ARBITRARY_98c427", "timed_out": true, "elapsed_seconds": 0.1, "started": true, "failure_type": "R3_FAKE_SECRET_ARB...
+E
+E     ...Full output truncated (2 lines hidden), use '-vv' to show)
+_ test_cli_failure_summary_keeps_unknown_exit_and_launch_timeout_state[False-False] _
+tests\test_cli_failure_evidence.py:165: in test_cli_failure_summary_keeps_unknown_exit_and_launch_timeout_state
+    assert all(marker not in stderr for marker in MARKERS.values())
+E   assert False
+E    +  where False = all(<generator object test_cli_failure_summary_keeps_unknown_exit_and_launch_timeout_state.<locals>.<genexpr> at 0x000001B520756810>)
+_ test_cli_failure_summary_keeps_unknown_exit_and_launch_timeout_state[True-True] _
+tests\test_cli_failure_evidence.py:165: in test_cli_failure_summary_keeps_unknown_exit_and_launch_timeout_state
+    assert all(marker not in stderr for marker in MARKERS.values())
+E   assert False
+E    +  where False = all(<generator object test_cli_failure_summary_keeps_unknown_exit_and_launch_timeout_state.<locals>.<genexpr> at 0x000001B520756F60>)
+=========================== short test summary info ===========================
+FAILED tests/test_cli_failure_evidence.py::test_cli_failure_hides_content_but_preserves_python_evidence[RuntimeError-1-single]
+FAILED tests/test_cli_failure_evidence.py::test_cli_failure_hides_content_but_preserves_python_evidence[RuntimeError-1-controller]
+FAILED tests/test_cli_failure_evidence.py::test_cli_failure_hides_content_but_preserves_python_evidence[KeyboardInterrupt-130-single]
+FAILED tests/test_cli_failure_evidence.py::test_cli_failure_hides_content_but_preserves_python_evidence[KeyboardInterrupt-130-controller]
+FAILED tests/test_cli_failure_evidence.py::test_cli_input_and_setup_exceptions_do_not_echo_sensitive_messages[task-file]
+FAILED tests/test_cli_failure_evidence.py::test_cli_input_and_setup_exceptions_do_not_echo_sensitive_messages[worker-setup]
+FAILED tests/test_cli_failure_evidence.py::test_cli_failure_allowlist_hides_unknown_labels_and_exception_type
+FAILED tests/test_cli_failure_evidence.py::test_cli_failure_summary_keeps_unknown_exit_and_launch_timeout_state[False-False]
+FAILED tests/test_cli_failure_evidence.py::test_cli_failure_summary_keeps_unknown_exit_and_launch_timeout_state[True-True]
+9 failed in 8.01s

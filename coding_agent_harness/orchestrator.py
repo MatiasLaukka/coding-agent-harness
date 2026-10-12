@@ -13,7 +13,7 @@ from .verifier import (
     VerificationResult,
     run_verification,
 )
-from .worker import WorkerRunResult
+from .worker import WorkerRunResult, classify_worker_run
 
 class RunFinding(StrictModel):
     code: Literal[
@@ -59,23 +59,51 @@ def run_task(
     worker: Worker,
     verification_commands: Sequence[VerificationCommand],
 ) -> TaskRunResult:
-    baseline = capture_baseline(repo_dir)
+    context = {"stage": "baseline", "worker_invocation_count": 0}
+    try:
+        return _run_task(task=task, repo_dir=repo_dir, worker=worker,
+                         verification_commands=verification_commands, context=context)
+    except BaseException as exc:
+        context["failure_type"] = type(exc).__name__
+        if hasattr(exc, "verification_result"):
+            context["verification"] = exc.verification_result
+            context["failed_command"] = exc.failed_command
+        if hasattr(exc, "process_result"):
+            context["failed_process"] = exc.process_result
+        if hasattr(exc, "git_evidence"):
+            context["partial_git_evidence"] = exc.git_evidence
+        exc.harness_evidence = context
+        raise
 
-    worker_result = worker.run(
+
+def _run_task(*, task, repo_dir, worker, verification_commands, context) -> TaskRunResult:
+    baseline = capture_baseline(repo_dir)
+    context["baseline"] = baseline
+    context["stage"] = "worker"
+
+    worker_run = worker.run
+    context["worker_invocation_count"] += 1
+    worker_result = worker_run(
         task=task,
         repo_dir=repo_dir,
     )
 
+    context["worker_result"] = worker_result
+    context["stage"] = "git-evidence"
     evidence = capture_evidence(
         repo=repo_dir,
         baseline=baseline,
     )
 
+    context["git_evidence"] = evidence
+    context["stage"] = "verification"
     verification = run_verification(
         repo_dir=repo_dir,
         commands=verification_commands,
     )
 
+    context["verification"] = verification
+    context["stage"] = "findings"
     findings: list[RunFinding] = []
 
     if worker_result.process.timed_out:
@@ -96,6 +124,10 @@ def run_task(
                 ),
             )
         )
+
+    assessment = classify_worker_run(worker_result)
+    if worker_result.process.infrastructure_failed and not worker_result.process.timed_out:
+        findings.append(RunFinding(code="worker-failed", detail=assessment.reason))
 
     completion = worker_result.completion
 
@@ -173,6 +205,7 @@ def run_task(
             )
         )
 
+    context["stage"] = "result-construction"
     return TaskRunResult(
         task_id=task.task_id,
         baseline_sha=baseline.commit,

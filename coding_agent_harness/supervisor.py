@@ -423,6 +423,7 @@ class IndependentObservations(Document):
 
 
 class CheckSummary(Document):
+    infrastructure_failed: bool = False
     id: Label
     specification_sha256: Digest
     expectation: Literal["must_pass", "expected_failure", "advisory"]
@@ -433,7 +434,20 @@ class CheckSummary(Document):
     elapsed_seconds: float = Field(ge=0, allow_inf_nan=False)
 
 
+def _check_observation(check):
+    # The projected flag carries capture/cleanup/launch failures without sharing
+    # raw argv/output. Timeout and missing exit remain independently checkable.
+    infrastructure_failed = check.infrastructure_failed or check.timed_out or check.exit_code is None
+    passed = check.exit_code == 0 and not infrastructure_failed
+    met = (None if check.expectation == "advisory" else
+           passed if check.expectation == "must_pass" else
+           not infrastructure_failed and check.exit_code != 0)
+    allows_success = not infrastructure_failed and (passed if check.expectation == "must_pass" else True)
+    return passed, met, allows_success
+
+
 class CallbackSummary(Document):
+    worker_infrastructure_failed: bool = False
     attempt: int = Field(ge=1, le=32)
     task_sha256: Digest
     source_sha256: Digest
@@ -454,7 +468,7 @@ class CallbackSummary(Document):
         claims = self.worker_claims
         if (claims.completion_status is None) != (claims.completion_sha256 is None):
             raise ValueError("invalid_completion_provenance")
-        expected = ("execution-failure" if self.worker_timed_out or
+        expected = ("execution-failure" if self.worker_infrastructure_failed or self.worker_timed_out or
                     self.worker_exit_code is None or self.worker_exit_code != 0 else
                     "protocol-failure" if claims.completion_status is None else
                     claims.completion_status)
@@ -462,14 +476,10 @@ class CallbackSummary(Document):
             raise ValueError("invalid_worker_provenance")
         overall = True
         for check in self.checks:
-            passed = check.exit_code == 0 and not check.timed_out
-            met = (None if check.expectation == "advisory" else
-                   passed if check.expectation == "must_pass" else
-                   not check.timed_out and check.exit_code is not None and check.exit_code != 0)
+            passed, met, allows_success = _check_observation(check)
             if check.passed != passed or check.expectation_met != met:
                 raise ValueError("invalid_check_provenance")
-            overall &= (passed if check.expectation == "must_pass" else
-                        not check.timed_out if check.expectation == "expected_failure" else True)
+            overall &= allows_success
         if self.verification_passed != overall:
             raise ValueError("invalid_check_provenance")
         facts = self.independent_observations
@@ -536,6 +546,15 @@ class HandoffSummary(Document):
         if self.controller_baseline_confirmed != (self.baseline is not None and bool(self.callbacks)):
             raise ValueError("invalid_baseline")
         for callback in self.callbacks:
+            infrastructure_failed = (callback.worker_infrastructure_failed or
+                callback.worker_timed_out or callback.worker_exit_code is None or
+                any(c.infrastructure_failed or c.timed_out or c.exit_code is None
+                    for c in callback.checks))
+            has_later_attempt = (any(n > callback.attempt for n in nums) or
+                (self.termination.attempts is not None and
+                 self.termination.attempts > callback.attempt))
+            if infrastructure_failed and has_later_attempt:
+                raise ValueError("invalid_infrastructure_retry")
             if callback.attempt == 1 and callback.task_sha256 != self.original_task_sha256:
                 raise ValueError("invalid_task_provenance")
             if self.baseline is not None and (
@@ -566,7 +585,11 @@ class HandoffSummary(Document):
                             "scope-violation" if final.independent_observations.file_scope == "out_of_scope"
                             else "verification-failure" if not final.verification_passed else "accepted")
             else:
-                expected = "remediation-exhausted"
+                expected = ("worker-failure" if final.worker_infrastructure_failed or
+                            final.worker_timed_out or final.worker_exit_code is None else
+                            "verification-failure" if any(c.infrastructure_failed or
+                            c.timed_out or c.exit_code is None for c in final.checks)
+                            else "remediation-exhausted")
             if self.termination.status != expected:
                 raise ValueError("invalid_controller_provenance")
         if self.termination.attempts is not None and self.controller_max_remediation_attempts is not None:
@@ -602,13 +625,9 @@ def _check_provenance(callback: CallbackRecord, commands: Sequence[VerificationC
     for check, command in zip(checks, commands):
         _contradiction(any(getattr(check, key) != getattr(command, key)
                            for key in ("id", "argv", "expectation", "expectation_reason")))
-        passed = check.exit_code == 0 and not check.timed_out
-        met = (None if command.expectation == "advisory" else
-               passed if command.expectation == "must_pass" else
-               not check.timed_out and check.exit_code is not None and check.exit_code != 0)
+        passed, met, allows_success = _check_observation(check)
         _contradiction(check.passed != passed or check.expectation_met != met)
-        overall &= (passed if command.expectation == "must_pass" else
-                    not check.timed_out if command.expectation == "expected_failure" else True)
+        overall &= allows_success
     _contradiction(callback.verification.passed != overall)
 
 
@@ -624,6 +643,10 @@ def _expected_status(callback: CallbackRecord, budget: int | None) -> str | None
         if _scope(callback):
             return "scope-violation"
         return "accepted" if callback.verification.passed else "verification-failure"
+    if callback.worker_result.process.infrastructure_failed:
+        return "worker-failure"
+    if any(check.infrastructure_failed for check in callback.verification.checks):
+        return "verification-failure"
     if budget is None:
         return None
     _contradiction(callback.attempt - 1 < budget)
@@ -633,6 +656,8 @@ def _expected_status(callback: CallbackRecord, budget: int | None) -> str | None
 def _transition(original: TaskPacket, previous: CallbackRecord, current: CallbackRecord,
                 history: Sequence[CallbackRecord]) -> None:
     decision = previous.review_decision
+    _contradiction(previous.worker_result.process.infrastructure_failed or
+                   any(check.infrastructure_failed for check in previous.verification.checks))
     _contradiction(decision is None or decision.decision not in ("remediate", "revise-scope"))
     revision = decision.decision == "revise-scope"
     count = sum(c.review_decision is not None and
@@ -759,6 +784,7 @@ def build_handoff(record: RecordedRun) -> HandoffSummary:
             summaries.append(CallbackSummary(
                 attempt=c.attempt, task_sha256=canonical_digest(c.task), source_sha256=canonical_digest(c),
                 worker_exit_code=process.exit_code, worker_timed_out=process.timed_out,
+                worker_infrastructure_failed=process.infrastructure_failed,
                 worker_elapsed_seconds=process.elapsed_seconds, worker_outcome=c.worker_assessment.outcome,
                 worker_claims=WorkerClaims(completion_status=completion.status if completion else None,
                     completion_sha256=canonical_digest(completion) if completion else None,
@@ -779,6 +805,7 @@ def build_handoff(record: RecordedRun) -> HandoffSummary:
                 checks=[CheckSummary(id=_safe_label(check.id), specification_sha256=canonical_digest(command),
                     expectation=check.expectation, passed=check.passed, expectation_met=check.expectation_met,
                     exit_code=check.exit_code, timed_out=check.timed_out,
+                    infrastructure_failed=check.infrastructure_failed,
                     elapsed_seconds=check.elapsed_seconds) for check,command in
                     zip(c.verification.checks,record.verification_commands)],
                 reviewer_decision=c.review_decision.decision if c.review_decision else None,

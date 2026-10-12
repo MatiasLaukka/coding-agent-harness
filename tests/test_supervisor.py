@@ -327,7 +327,7 @@ def test_optional_attempt_evidence_checks_disagreement(repo):
 
 @pytest.mark.parametrize("expectation,status", [
     ("must_pass","verification-failure"), ("expected_failure","verification-failure"),
-    ("advisory","accepted")])
+    ("advisory","verification-failure")])
 def test_verification_timeout_policy(repo,expectation,status):
     checks=[VerificationCommand(id="timeout",argv=[sys.executable,"-c",
         "import time; time.sleep(5)"],timeout_seconds=1,expectation=expectation,

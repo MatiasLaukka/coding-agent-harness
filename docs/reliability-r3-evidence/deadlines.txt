@@ -1,0 +1,5 @@
+inherited pipes: {"elapsed_seconds": 1.2190000000409782, "exit_code": 0, "output_complete": false, "cleanup_errors": ["tree-root-unavailable"], "surviving_pids": []}
+.failed cleanup: {"elapsed_seconds": 1.202999999979511, "exit_code": null, "output_complete": false, "cleanup_errors": ["cleanup-result-unavailable", "parent-still-running"], "surviving_pids": [163072]}
+.discoverable tree: {"elapsed_seconds": 1.6870000001508743, "exit_code": 15, "output_complete": true, "cleanup_errors": [], "surviving_pids": []}
+.
+3 passed, 31 deselected in 6.41s

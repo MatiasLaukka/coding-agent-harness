@@ -8,13 +8,11 @@ from coding_agent_harness.models import (
     StrictModel,
     VerificationCommand,
 )
-from coding_agent_harness.process import run_process
+from coding_agent_harness.process import ProcessResult, run_process
 
 
-class VerificationCheck(StrictModel):
+class VerificationCheck(ProcessResult):
     id: str
-    argv: list[str]
-
     passed: bool
 
     expectation: Literal[
@@ -25,12 +23,6 @@ class VerificationCheck(StrictModel):
 
     expectation_reason: str | None = None
     expectation_met: bool | None = None
-
-    exit_code: int | None
-    timed_out: bool
-    stdout: str
-    stderr: str
-    elapsed_seconds: float
 
     @model_validator(mode="after")
     def derive_expectation_met(
@@ -48,7 +40,8 @@ class VerificationCheck(StrictModel):
             return self
 
         self.expectation_met = (
-            not self.timed_out
+            not self.infrastructure_failed
+            and not self.timed_out
             and self.exit_code is not None
             and self.exit_code != 0
         )
@@ -108,47 +101,52 @@ def run_verification(
     checks: list[VerificationCheck] = []
     overall_passed = True
 
-    for command in commands:
-        process = run_process(
-            argv=command.argv,
-            cwd=repo_dir,
-            timeout_seconds=command.timeout_seconds,
-        )
+    command = None
+    try:
+        for command in commands:
+            process = run_process(
+                argv=command.argv,
+                cwd=repo_dir,
+                timeout_seconds=command.timeout_seconds,
+            )
 
-        passed = (
-            not process.timed_out
-            and process.exit_code == 0
-        )
+            passed = (
+                not process.infrastructure_failed
+                and process.exit_code == 0
+            )
 
-        expectation_met = _expectation_met(
-            command,
-            passed=passed,
-            timed_out=process.timed_out,
-            exit_code=process.exit_code,
-        )
+            expectation_met = _expectation_met(
+                command,
+                passed=passed,
+                timed_out=process.timed_out,
+                exit_code=process.exit_code,
+            )
 
-        check = VerificationCheck(
-            id=command.id,
-            argv=list(command.argv),
-            passed=passed,
-            expectation=command.expectation,
-            expectation_reason=command.expectation_reason,
-            expectation_met=expectation_met,
-            exit_code=process.exit_code,
-            timed_out=process.timed_out,
-            stdout=process.stdout,
-            stderr=process.stderr,
-            elapsed_seconds=process.elapsed_seconds,
-        )
+            if process.infrastructure_failed and command.expectation != "advisory":
+                expectation_met = False
 
-        checks.append(check)
+            check = VerificationCheck(
+                **process.model_dump(),
+                id=command.id,
+                passed=passed,
+                expectation=command.expectation,
+                expectation_reason=command.expectation_reason,
+                expectation_met=expectation_met,
+            )
 
-        if not _check_allows_overall_success(
-            command,
-            passed=passed,
-            timed_out=process.timed_out,
-        ):
-            overall_passed = False
+            checks.append(check)
+
+            if process.infrastructure_failed or not _check_allows_overall_success(
+                command,
+                passed=passed,
+                timed_out=process.timed_out,
+            ):
+                overall_passed = False
+
+    except BaseException as exc:
+        exc.verification_result = VerificationResult(passed=False, checks=checks)
+        exc.failed_command = command
+        raise
 
     return VerificationResult(
         passed=overall_passed,

@@ -1,0 +1,42 @@
+........................................................................ [ 24%]
+........................................................................ [ 49%]
+...........................................................F............ [ 73%]
+........................................................................ [ 98%]
+....                                                                     [100%]
+================================== FAILURES ===================================
+_____________ test_verification_timeout_policy[advisory-accepted] _____________
+
+repo = WindowsPath('D:/Documents/coding-agent-harness-reliability-r3/.r3-evidence/final-temp/test_verification_timeout_poli2/target')
+expectation = 'advisory', status = 'accepted'
+
+    @pytest.mark.parametrize("expectation,status", [
+        ("must_pass","verification-failure"), ("expected_failure","verification-failure"),
+        ("advisory","accepted")])
+    def test_verification_timeout_policy(repo,expectation,status):
+        checks=[VerificationCommand(id="timeout",argv=[sys.executable,"-c",
+            "import time; time.sleep(5)"],timeout_seconds=1,expectation=expectation,
+            expectation_reason="expected" if expectation=="expected_failure" else None)]
+        record=recorded(repo,commands=checks)
+        assert record.callbacks[0].verification.checks[0].timed_out
+>       assert build_handoff(record).termination.status == status
+               ^^^^^^^^^^^^^^^^^^^^^
+
+tests\test_supervisor.py:337:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+coding_agent_harness\supervisor.py:706: in build_handoff
+    _check_provenance(callback, record.verification_commands)
+coding_agent_harness\supervisor.py:612: in _check_provenance
+    _contradiction(callback.verification.passed != overall)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+condition = True
+
+    def _contradiction(condition: bool) -> None:
+        if condition:
+>           raise HandoffError("contradictory_provenance")
+E           coding_agent_harness.supervisor.HandoffError: contradictory_provenance
+
+coding_agent_harness\supervisor.py:589: HandoffError
+=========================== short test summary info ===========================
+FAILED tests/test_supervisor.py::test_verification_timeout_policy[advisory-accepted]
+1 failed, 291 passed in 217.21s (0:03:37)

@@ -184,16 +184,27 @@ def capture_evidence(
     repo: Path,
     baseline: GitBaseline,
 ) -> GitEvidence:
+    partial = {"baseline_commit": baseline.commit}
+    try:
+        return _capture_evidence(repo=repo, baseline=baseline, partial=partial)
+    except BaseException as exc:
+        exc.git_evidence = partial
+        raise
+
+
+def _capture_evidence(*, repo, baseline, partial) -> GitEvidence:
     final_head = _git(
         repo,
         "rev-parse",
         "HEAD",
     ).strip()
 
+    partial["final_head"] = final_head
     final_status = _status(
         repo
     )
 
+    partial["final_status"] = final_status
     tracked_changes = _git_z(
         repo,
         "diff",
@@ -204,6 +215,7 @@ def capture_evidence(
         "--",
     )
 
+    partial["tracked_changes"] = tracked_changes
     untracked_files = _git_z(
         repo,
         "ls-files",
@@ -219,12 +231,14 @@ def capture_evidence(
         )
     )
 
+    partial["changed_files"] = changed_files
     patch = _capture_patch_with_untracked(
         repo=repo,
         baseline_commit=baseline.commit,
         untracked_files=untracked_files,
     )
 
+    partial["patch"] = patch
     commits_output = _git(
         repo,
         "log",
@@ -238,6 +252,7 @@ def capture_evidence(
         if line.strip()
     ]
 
+    partial["commits"] = commits
     return GitEvidence(
         baseline_commit=baseline.commit,
         final_head=final_head,

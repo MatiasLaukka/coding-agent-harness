@@ -46,6 +46,12 @@ def classify_worker_run(
             reason="worker process timed out",
         )
 
+    if run.process.infrastructure_failed:
+        return WorkerRunAssessment(
+            outcome="execution-failure",
+            reason="worker execution evidence is incomplete or infrastructure failed",
+        )
+
     if run.process.exit_code is None:
         return WorkerRunAssessment(
             outcome="execution-failure",
@@ -307,11 +313,10 @@ class QwenWorker:
             ),
         )
 
-        completion, completion_error = (
-            _parse_completion(
-                process.stdout
-            )
-        )
+        if process.stdout_truncated or not process.output_complete:
+            completion, completion_error = None, "incomplete stdout; completion cannot be validated"
+        else:
+            completion, completion_error = _parse_completion(process.stdout)
 
         return WorkerRunResult(
             process=process,

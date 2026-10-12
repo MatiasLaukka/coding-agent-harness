@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import builtins
+import hashlib
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Sequence
@@ -14,7 +17,10 @@ from .models import (
     VerificationCommand,
 )
 from .orchestrator import TaskRunResult, run_task
-from .worker import QwenWorker
+from .worker import QwenWorker, WorkerRunResult
+from .git import GitBaseline, GitEvidence
+from .process import ProcessResult
+from .verifier import VerificationResult
 
 
 class TaskFile(StrictModel):
@@ -150,6 +156,118 @@ def _print_result(
         )
 
 
+_FAILURE_STAGES = frozenset({
+    "baseline", "attempt-snapshot", "worker", "worker-classification", "git-evidence",
+    "attempt-evidence", "scope-assessment", "verification", "verification-assessment",
+    "review", "review-validation", "result-or-retry", "findings", "result-construction",
+    "task-file", "worker-setup",
+})
+_FAILURE_TYPES = frozenset(name for name, value in vars(builtins).items()
+    if isinstance(value, type) and issubclass(value, BaseException)) | {
+    "ValidationError", "CalledProcessError", "TimeoutExpired", "AccessDenied",
+    "NoSuchProcess", "ZombieProcess", "HandoffError",
+}
+
+
+def _identity(value):
+    """Hash only known text shapes; never serialize arbitrary evidence objects."""
+    if type(value) is str:
+        raw = value.encode("utf-8")
+    elif type(value) is list and all(type(item) is str for item in value):
+        raw = json.dumps(value, ensure_ascii=False).encode("utf-8")
+    else:
+        return None
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _failure_type(name):
+    return name if type(name) is str and name in _FAILURE_TYPES else "other"
+
+
+def _process_summary(process: ProcessResult) -> dict:
+    fields = ("started", "exit_code", "timed_out", "cancelled", "elapsed_seconds",
+              "output_complete", "stdout_truncated", "stderr_truncated", "cleanup_attempted")
+    result = {name: value for name in fields
+              if (value := getattr(process, name)) is None or type(value) in (bool, int, float)}
+    result.update(
+        infrastructure_failed=process.infrastructure_failed,
+        failure_type=_failure_type(process.failure_type) if process.failure_type else None,
+        failure_type_sha256=_identity(process.failure_type),
+        argv_sha256=_identity(process.argv),
+        stdout_sha256=_identity(process.stdout), stderr_sha256=_identity(process.stderr),
+        cleanup_error_count=len(process.cleanup_errors),
+        cleanup_errors_sha256=_identity(process.cleanup_errors),
+        surviving_pid_count=len(process.surviving_pids),
+    )
+    return result
+
+
+def _git_summary(evidence) -> dict:
+    if isinstance(evidence, (GitBaseline, GitEvidence)):
+        get = lambda key: getattr(evidence, key, None)
+    elif type(evidence) is dict:
+        get = evidence.get
+    else:
+        return {}
+    result = {}
+    for key in ("commit", "baseline_commit", "final_head"):
+        value = get(key)
+        if type(value) is str and re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", value):
+            result[key] = value
+    for key in ("status", "final_status", "patch"):
+        if (digest := _identity(get(key))) is not None:
+            result[key + "_sha256"] = digest
+    for key in ("changed_files", "commits"):
+        if type(value := get(key)) is list:
+            result[key + "_count"] = len(value)
+    return result
+
+
+def _failure_record_summary(record: dict) -> dict:
+    """Project named native observations; unknown fields and text stay private."""
+    result = {}
+    worker = record.get("worker_result")
+    if isinstance(worker, WorkerRunResult):
+        result["worker_result"] = {"process": _process_summary(worker.process)}
+    if isinstance(process := record.get("failed_process"), ProcessResult):
+        result["failed_process"] = _process_summary(process)
+    for key in ("baseline", "git_evidence", "partial_git_evidence"):
+        if key in record:
+            result[key] = _git_summary(record[key])
+    verification = record.get("verification")
+    if isinstance(verification, VerificationResult):
+        result["verification"] = {
+            "passed": verification.passed, "completed_check_count": len(verification.checks),
+            "checks": [{**_process_summary(check), "id_sha256": _identity(check.id),
+                        "passed": check.passed, "expectation_met": check.expectation_met}
+                       for check in verification.checks],
+        }
+    return result
+
+
+def _print_failure_evidence(exc: BaseException, *, stage: str = "unknown",
+                            worker_invocation_count: int | None = None) -> None:
+    """Print an allowlisted summary; rich native exception evidence stays intact."""
+    try:
+        evidence = getattr(exc, "harness_evidence", None)
+        evidence = evidence if type(evidence) is dict else {}
+        observed_stage = evidence.get("stage", stage)
+        stage = observed_stage if type(observed_stage) is str and observed_stage in _FAILURE_STAGES else "unknown"
+        attempts = evidence.get("attempts")
+        summary = _failure_record_summary(evidence)
+        if type(attempts) is list:
+            summary["attempts"] = [_failure_record_summary(a) if type(a) is dict else {}
+                                   for a in attempts]
+        count = evidence.get("worker_invocation_count", worker_invocation_count)
+        if type(count) is not int or count < 0:
+            count = None
+        summary.update(stage=stage, failure_type=_failure_type(type(exc).__name__),
+                       failure_type_sha256=_identity(type(exc).__name__), attempt_count=count)
+        print("Failure evidence: " + json.dumps(summary), file=sys.stderr)
+    except Exception:
+        print("Failure evidence unavailable.", file=sys.stderr)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="coding-harness",
@@ -254,7 +372,7 @@ def app(
 
     if not repo_dir.is_dir():
         print(
-            f"Repository does not exist: {repo_dir}",
+            "Repository does not exist.",
             file=sys.stderr,
         )
         return 1
@@ -269,11 +387,13 @@ def app(
         ValidationError,
     ) as exc:
         print(
-            f"Task file error: {exc}",
+            "Task file error: details omitted.",
             file=sys.stderr,
         )
+        _print_failure_evidence(exc, stage="task-file", worker_invocation_count=0)
         return 1
 
+    worker_invocation_count = 0
     try:
         worker = QwenWorker(
             command=[
@@ -285,6 +405,8 @@ def app(
             ),
         )
 
+        # After delegation only native execution evidence can establish the count.
+        worker_invocation_count = None
         result = run_task(
             task=spec.task,
             repo_dir=repo_dir,
@@ -293,11 +415,18 @@ def app(
                 spec.verification_commands
             ),
         )
+    except KeyboardInterrupt as exc:
+        print("Harness run interrupted.", file=sys.stderr)
+        _print_failure_evidence(exc, stage="worker-setup",
+                                worker_invocation_count=worker_invocation_count)
+        return 130
     except Exception as exc:
         print(
-            f"Harness run failed: {exc}",
+            "Harness run failed.",
             file=sys.stderr,
         )
+        _print_failure_evidence(exc, stage="worker-setup",
+                                worker_invocation_count=worker_invocation_count)
         return 1
 
     _print_result(
