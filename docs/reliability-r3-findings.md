@@ -111,14 +111,14 @@ Git capture exceptions carry `exc.git_evidence`, a partial dictionary with only
 completed fields, forwarded as `partial_git_evidence`. Original Git
 CalledProcessError objects retain their command/output/exit information.
 
-The CLI reports these observations on stderr as `Failure evidence: {JSON}`.
-Raw stdout/stderr and Git patches remain available and may contain user data;
-this payload is not generally secret-safe.
-Command arguments are replaced with a SHA-256 identity and task objects with task
-ID; ordinary runtime errors still exit 1 and cancellation exits 130. Reporting
-serialization failure is itself explicitly reported. Evidence is available to
-API callers before propagation; callers may serialize native models with
-`model_dump`. This is not a durable execution journal.
+The CLI reports an allowlisted failure summary on stderr as
+`Failure evidence: {JSON}`. The disclosure correction described below replaces
+the initial recursive R3 printer. Raw output, patches, task text, paths, arbitrary
+evidence fields and exception messages stay in the native Python evidence.
+Ordinary runtime errors still exit 1 and cancellation exits 130. Reporting failure
+produces a fixed unavailable message. API callers retain the original exception
+and native models and may serialize them with `model_dump`. This is not a durable
+execution journal.
 
 Reviewer calls still receive partial work and may explicitly stop. Acceptance
 cannot turn execution/protocol failure or failed verification into success.
@@ -293,3 +293,73 @@ or the local `.r3-evidence/review.diff` generated after the commit. The implemen
 commit ID is supplied in the engineering handoff; it cannot be embedded in its
 own committed contents without a self-reference. Main and existing checkout
 files remain unchanged. No push, merge or pull request is authorized or performed.
+
+
+## CLI disclosure follow-up (pending independent review)
+
+Baseline: local R3 commit `b2d003b26d0ab6b3da2b616bfef53c7149d91062` on the
+same isolated branch. Severity: **High**. The recursive evidence printer exposed
+worker stdout/stderr, completed verification output, Git patches, cleanup text,
+check IDs and unknown dictionary fields. The run-error handler printed raw
+exception messages; task validation also exposed rejected input through
+Pydantic's exception text. These channels can put repository secrets in terminal
+or CI logs even though command arguments were hashed.
+
+Nine offline regressions failed against the original R3 code in **8.01 s**.
+They use distinctive fake secrets with real local Git capture, the actual
+single-run/controller wrappers and verification collector, and in-memory workers
+and subprocess results. Both RuntimeError and KeyboardInterrupt preserve a
+successful completed check before a subsequent failure. No worker executable,
+model, provider, protected experiment or network is involved.
+
+The correction changes only the CLI presentation boundary. Its explicit
+projection includes known stage/type labels, attempted invocation count (null
+when unknown), process started/exit/timeout/cancellation and elapsed metadata,
+output completeness/truncation, infrastructure-failure flags, cleanup error and
+observed survivor counts, completed-check observations, validated Git commit
+identities, and SHA-256 identities for commands, captured streams, patches, status,
+check IDs and cleanup errors. Unknown exception type names become `other` plus
+an identity hash; unknown stages become `unknown`. Unknown evidence fields and
+objects are ignored rather than recursively serialized. Cleanup counts do not
+assert universal process-tree containment. No missing check is called successful.
+
+The printer neither mutates nor replaces `exc.harness_evidence`, native process
+results, captured streams, Git evidence, completed checks or the original
+exception/message. The tests inspect them after CLI reporting and prove all
+fake-secret markers are absent from stderr (and stdout for these exception
+paths). Input/setup failures also have fixed messages and safe summaries.
+All existing R2/R3 tests and assertions remain intact.
+
+Focused CLI/integration/R2/R3 suite: **86 passed in 73.21 s**. After the final
+unknown-count adjustment, disclosure regressions: **9 passed in 5.25 s**.
+**Complete offline suite: 305 passed in 193.62 s (3:13)**. Separate
+[red](reliability-r3-evidence/cli-disclosure-red.txt),
+[focused](reliability-r3-evidence/cli-disclosure-focused.txt),
+[regression](reliability-r3-evidence/cli-disclosure-green.txt) and
+[full](reliability-r3-evidence/cli-disclosure-full.txt) transcripts are committed.
+
+Reproduce using the existing venv from the R3 worktree:
+
+```powershell
+& 'D:\Documents\coding-agent-harness-public\.venv\Scripts\python.exe' -m pytest tests/test_cli_failure_evidence.py tests/test_cli.py tests/test_cli_integration.py tests/test_reliability_r2.py tests/test_reliability_r3.py --basetemp=.r3-evidence/cli-review-focused-temp -o addopts='' -q
+& 'D:\Documents\coding-agent-harness-public\.venv\Scripts\python.exe' -m pytest --basetemp=.r3-evidence/cli-review-full-temp -o addopts='' -q
+```
+
+Compatibility: the `Failure evidence:` line now contains a summary, not a raw
+recursive evidence dump. Consumers requiring rich content must inspect the
+Python exception evidence in an authorized environment. Python APIs, result
+models, exit codes, retry policy and process/Git execution behavior are unchanged.
+No opt-in raw CLI dump was added. The original R3 transcripts remain unchanged;
+follow-up red/focused/full transcripts are recorded separately.
+
+Remaining risks: plain hashes provide correlation and can permit guessing of
+low-entropy content; they are not encryption. Native Python evidence deliberately
+retains sensitive content and requires appropriate access control when exported.
+The ordinary CLI review surface on stdout still prints task results and patches;
+this correction targets exception/input failure stderr, not all CLI output or
+argument-parser diagnostics. It does not remove R3's documented containment,
+blocked-reader, Git deadline or crash-durability limitations.
+
+The local follow-up diff is `.r3-evidence/cli-disclosure-review.diff`, measured
+against the R3 baseline above; its commit ID is supplied in the handoff.
+No push, PR, merge or change to main. **Stop for independent review.**
