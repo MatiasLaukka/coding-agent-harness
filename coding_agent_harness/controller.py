@@ -120,7 +120,7 @@ class HarnessController:
             VerificationCommand
         ],
     ) -> HarnessRunResult:
-        context = {"attempts": [], "stage": "baseline"}
+        context = {"attempts": [], "stage": "baseline", "worker_invocation_count": 0}
         try:
             return self._run(task=task, repo_dir=repo_dir,
                              verification_commands=verification_commands, context=context)
@@ -161,7 +161,9 @@ class HarnessController:
 
             record["snapshot"] = attempt_snapshot
             context["stage"] = "worker"
-            worker_result = self.worker.run(
+            worker_run = self.worker.run
+            context["worker_invocation_count"] += 1
+            worker_result = worker_run(
                 task=current_task,
                 repo_dir=repo_dir,
             )

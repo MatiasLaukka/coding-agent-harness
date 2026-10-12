@@ -59,7 +59,7 @@ def run_task(
     worker: Worker,
     verification_commands: Sequence[VerificationCommand],
 ) -> TaskRunResult:
-    context = {"stage": "baseline"}
+    context = {"stage": "baseline", "worker_invocation_count": 0}
     try:
         return _run_task(task=task, repo_dir=repo_dir, worker=worker,
                          verification_commands=verification_commands, context=context)
@@ -81,7 +81,9 @@ def _run_task(*, task, repo_dir, worker, verification_commands, context) -> Task
     context["baseline"] = baseline
     context["stage"] = "worker"
 
-    worker_result = worker.run(
+    worker_run = worker.run
+    context["worker_invocation_count"] += 1
+    worker_result = worker_run(
         task=task,
         repo_dir=repo_dir,
     )

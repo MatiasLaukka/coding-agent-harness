@@ -245,7 +245,8 @@ def _failure_record_summary(record: dict) -> dict:
     return result
 
 
-def _print_failure_evidence(exc: BaseException, *, stage: str = "unknown") -> None:
+def _print_failure_evidence(exc: BaseException, *, stage: str = "unknown",
+                            worker_invocation_count: int | None = None) -> None:
     """Print an allowlisted summary; rich native exception evidence stays intact."""
     try:
         evidence = getattr(exc, "harness_evidence", None)
@@ -257,10 +258,9 @@ def _print_failure_evidence(exc: BaseException, *, stage: str = "unknown") -> No
         if type(attempts) is list:
             summary["attempts"] = [_failure_record_summary(a) if type(a) is dict else {}
                                    for a in attempts]
-            count = len(attempts)
-        else:
-            count = (None if stage == "unknown" else
-                     int(stage not in ("baseline", "task-file", "worker-setup")))
+        count = evidence.get("worker_invocation_count", worker_invocation_count)
+        if type(count) is not int or count < 0:
+            count = None
         summary.update(stage=stage, failure_type=_failure_type(type(exc).__name__),
                        failure_type_sha256=_identity(type(exc).__name__), attempt_count=count)
         print("Failure evidence: " + json.dumps(summary), file=sys.stderr)
@@ -390,9 +390,10 @@ def app(
             "Task file error: details omitted.",
             file=sys.stderr,
         )
-        _print_failure_evidence(exc, stage="task-file")
+        _print_failure_evidence(exc, stage="task-file", worker_invocation_count=0)
         return 1
 
+    worker_invocation_count = 0
     try:
         worker = QwenWorker(
             command=[
@@ -404,6 +405,8 @@ def app(
             ),
         )
 
+        # After delegation only native execution evidence can establish the count.
+        worker_invocation_count = None
         result = run_task(
             task=spec.task,
             repo_dir=repo_dir,
@@ -414,14 +417,16 @@ def app(
         )
     except KeyboardInterrupt as exc:
         print("Harness run interrupted.", file=sys.stderr)
-        _print_failure_evidence(exc, stage="worker-setup")
+        _print_failure_evidence(exc, stage="worker-setup",
+                                worker_invocation_count=worker_invocation_count)
         return 130
     except Exception as exc:
         print(
             "Harness run failed.",
             file=sys.stderr,
         )
-        _print_failure_evidence(exc, stage="worker-setup")
+        _print_failure_evidence(exc, stage="worker-setup",
+                                worker_invocation_count=worker_invocation_count)
         return 1
 
     _print_result(

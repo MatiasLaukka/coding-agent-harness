@@ -363,3 +363,55 @@ blocked-reader, Git deadline or crash-durability limitations.
 The local follow-up diff is `.r3-evidence/cli-disclosure-review.diff`, measured
 against the R3 baseline above; its commit ID is supplied in the handoff.
 No push, PR, merge or change to main. **Stop for independent review.**
+
+
+## Invocation-count correction (pending review)
+
+Baseline: `2b10e6618099291bdf5137ae99cb61f3f3582dd4`, the CLI disclosure
+follow-up. The controller appends an attempt record before taking its snapshot;
+that record does not prove that a worker was invoked. The single-run orchestrator
+previously recorded no explicit invocation total. CLI stage/record-length guesses
+could therefore overcount snapshot failures, undercount partial records, and
+claim a count for delegated execution without sufficient evidence.
+
+Both execution wrappers now initialize `worker_invocation_count` to zero and
+increment it immediately before each `worker.run(...)` dispatch, after method
+lookup succeeds. The counter survives in the existing exception evidence.
+It counts attempted worker dispatches, including launch failures and calls that
+raise; it does not count completed results, logical attempt records, successful
+subprocess starts or verification commands. `ProcessResult.started` separately
+reports launch status. Existing result models and controller execution/retry
+semantics are unchanged.
+
+CLI `attempt_count` accepts only the explicit nonnegative integer counter.
+Missing/invalid counters produce JSON null, regardless of stage, record length,
+or apparent completion evidence. Empty, missing or partial attempt lists cannot
+replace or override a recorded total. Task loading and worker construction have
+an explicit known zero; after execution is delegated, the CLI requires native
+count evidence. It does not assume zero or one for uninstrumented delegates.
+The disclosure allowlist remains intact, and native observations are retained.
+
+Deterministic regressions cover zero invocations before baseline/snapshot/method
+lookup, failed launch with `started=False`, failure after one completed call,
+second-call failure (two dispatches), second-snapshot failure (one dispatch with
+two records), partial/missing records, invalid counters, and delegated execution
+without authoritative evidence. All 24 tests failed against the baseline in
+**8.85 s**. Focused count/CLI/disclosure/integration/R2/R3 suites: **110 passed in
+84.36 s**. **Full offline suite: 329 passed in 208.57 s (3:28)**. See the separate
+[red](reliability-r3-evidence/invocation-count-red.txt),
+[focused](reliability-r3-evidence/invocation-count-focused.txt) and
+[full](reliability-r3-evidence/invocation-count-full.txt) transcripts.
+
+```powershell
+& 'D:\Documents\coding-agent-harness-public\.venv\Scripts\python.exe' -m pytest tests/test_invocation_count.py tests/test_cli_failure_evidence.py tests/test_cli.py tests/test_cli_integration.py tests/test_reliability_r2.py tests/test_reliability_r3.py --basetemp=.r3-evidence/count-review-focused-temp -o addopts='' -q
+& 'D:\Documents\coding-agent-harness-public\.venv\Scripts\python.exe' -m pytest --basetemp=.r3-evidence/count-review-full-temp -o addopts='' -q
+```
+
+Compatibility is additive for native exception dictionaries. Existing or custom
+contexts without the counter now report null instead of an inferred number.
+The counter is an in-memory dispatch observation, not a durable journal or proof
+of a subprocess/model call; it does not measure retries internal to a custom
+worker implementation. Existing R3 lifecycle and disclosure limitations remain.
+No live workers/models, services, main changes, push, PR or merge were used.
+The exact follow-up diff is `.r3-evidence/invocation-count-review.diff`, against
+the baseline above. The commit ID is supplied in the handoff. Stop for review.
