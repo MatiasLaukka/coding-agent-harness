@@ -4,6 +4,7 @@ import math
 import os
 import re
 import tempfile
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -11,7 +12,11 @@ from pathlib import Path
 from typing import Iterator
 
 from coding_agent_harness.models import StrictModel
-from coding_agent_harness.process import ProcessResult, run_process
+from coding_agent_harness.process import (
+    PROCESS_CLEANUP_RESERVE_SECONDS,
+    ProcessResult,
+    run_process,
+)
 
 
 # Total monotonic budgets for each public Git evidence phase.
@@ -53,6 +58,7 @@ _GIT_FAILURE_STAGES = frozenset({
     "cumulative-tracked-files",
     "cumulative-untracked-files",
     "cumulative-patch-index-path",
+    "cumulative-patch-index-init",
     "cumulative-patch-index-copy",
     "cumulative-patch-index-add",
     "cumulative-patch-index-cleanup",
@@ -80,6 +86,9 @@ class GitFailureMetadata:
     stderr_truncated: bool = False
     cleanup_error_count: int = 0
     surviving_process_count: int = 0
+    filesystem_operation_pending_count: int = 0
+    temporary_artifact_unresolved_count: int = 0
+    temporary_artifact_cleanup_uncertain: bool = False
 
 
 class GitCollectionError(RuntimeError):
@@ -133,6 +142,10 @@ def _failure_metadata(
     process_result: ProcessResult | None = None,
     stdout_limit_bytes: int = GIT_STDOUT_LIMIT_BYTES,
     stderr_limit_bytes: int = GIT_STDERR_LIMIT_BYTES,
+    cleanup_error_count: int | None = None,
+    filesystem_operation_pending_count: int = 0,
+    temporary_artifact_unresolved_count: int = 0,
+    temporary_artifact_cleanup_uncertain: bool = False,
 ) -> GitFailureMetadata:
     return GitFailureMetadata(
         reason=reason,
@@ -142,8 +155,15 @@ def _failure_metadata(
         stderr_limit_bytes=stderr_limit_bytes,
         stdout_truncated=process_result.stdout_truncated if process_result is not None else False,
         stderr_truncated=process_result.stderr_truncated if process_result is not None else False,
-        cleanup_error_count=len(process_result.cleanup_errors) if process_result is not None else 0,
+        cleanup_error_count=(
+            cleanup_error_count
+            if cleanup_error_count is not None
+            else len(process_result.cleanup_errors) if process_result is not None else 0
+        ),
         surviving_process_count=len(process_result.surviving_pids) if process_result is not None else 0,
+        filesystem_operation_pending_count=filesystem_operation_pending_count,
+        temporary_artifact_unresolved_count=temporary_artifact_unresolved_count,
+        temporary_artifact_cleanup_uncertain=temporary_artifact_cleanup_uncertain,
     )
 
 
@@ -220,6 +240,149 @@ def _process_failure_reason(result: ProcessResult, deadline: float) -> str | Non
     return None
 
 
+def _filesystem_failure(
+    reason: str,
+    stage: str,
+    *,
+    pending: int = 0,
+    unresolved: int = 0,
+    cleanup_uncertain: bool = False,
+) -> GitCollectionError:
+    return GitCollectionError(
+        _failure_metadata(
+            reason,
+            stage,
+            filesystem_operation_pending_count=pending,
+            temporary_artifact_unresolved_count=unresolved,
+            temporary_artifact_cleanup_uncertain=cleanup_uncertain,
+        )
+    )
+
+
+def _bounded_filesystem_call(
+    operation,
+    *,
+    deadline: float,
+    stage: str,
+    pending_artifacts: int = 0,
+    cleanup: bool = False,
+    on_late_completion=None,
+):
+    """Run one blocking filesystem phase without extending its absolute deadline.
+
+    Python cannot cancel a blocked filesystem syscall. The daemon helper retains
+    ownership until it returns; if the caller abandons it, late cleanup runs only
+    after the syscall has completed. The caller receives explicit uncertainty.
+    """
+    _remaining(deadline, stage)
+    wait_deadline = deadline if cleanup else deadline - PROCESS_CLEANUP_RESERVE_SECONDS
+    if wait_deadline <= time.monotonic():
+        _raise_git_failure("deadline-exceeded", stage)
+
+    state_lock = threading.Lock()
+    completed = threading.Event()
+    decision = threading.Event()
+    state = {
+        "value": None,
+        "error": None,
+        "traceback": None,
+        "completed_at": None,
+        "abandoned": False,
+    }
+
+    def run_operation() -> None:
+        try:
+            value = operation()
+            error = None
+            error_traceback = None
+        except BaseException as exc:
+            value = None
+            error = exc
+            error_traceback = exc.__traceback__
+        with state_lock:
+            state["value"] = value
+            state["error"] = error
+            state["traceback"] = error_traceback
+            state["completed_at"] = time.monotonic()
+        completed.set()
+        decision.wait()
+        with state_lock:
+            abandoned = state["abandoned"]
+        if abandoned and on_late_completion is not None:
+            try:
+                on_late_completion(value, error)
+            except BaseException:
+                # The caller already failed closed and records unresolved
+                # artifacts. A late best-effort cleanup cannot revise it.
+                pass
+
+    helper = threading.Thread(
+        target=run_operation,
+        daemon=True,
+        name="harness-git-filesystem",
+    )
+    helper.start()
+
+    try:
+        completed.wait(max(0.0, wait_deadline - time.monotonic()))
+    except BaseException as exc:
+        with state_lock:
+            was_completed = state["completed_at"] is not None
+            state["abandoned"] = True
+        decision.set()
+        if not was_completed or on_late_completion is not None:
+            _attach_failure(
+                exc,
+                _failure_metadata(
+                    "incomplete-collection",
+                    stage,
+                    filesystem_operation_pending_count=1,
+                    temporary_artifact_unresolved_count=pending_artifacts,
+                    temporary_artifact_cleanup_uncertain=bool(pending_artifacts),
+                ),
+            )
+            exc.git_filesystem_operation_pending = True
+        raise
+
+    with state_lock:
+        completed_at = state["completed_at"]
+        value = state["value"]
+        error = state["error"]
+        error_traceback = state["traceback"]
+        pending = completed_at is None
+        late = not pending and (
+            completed_at >= wait_deadline or time.monotonic() >= deadline
+        )
+        state["abandoned"] = pending or late
+    decision.set()
+
+    if pending or late:
+        failure = _filesystem_failure(
+            "deadline-exceeded",
+            stage,
+            pending=1,
+            unresolved=pending_artifacts,
+            cleanup_uncertain=bool(pending_artifacts),
+        )
+        failure.git_filesystem_operation_pending = True
+        raise failure
+    if error is not None:
+        raise error.with_traceback(error_traceback)
+    _remaining(deadline, stage)
+    return value
+
+
+def _termination_confirmed(result: ProcessResult) -> bool:
+    return bool(
+        not result.started
+        or (
+            result.exit_code is not None
+            and not result.cleanup_errors
+            and not result.surviving_pids
+        )
+    )
+
+
 def _git(
     repo: Path,
     *args: str,
@@ -227,8 +390,12 @@ def _git(
     stage: str,
     env: dict[str, str] | None = None,
     stdout_limit_bytes: int = GIT_STDOUT_LIMIT_BYTES,
+    temporary_index: _TemporaryIndex | None = None,
 ) -> str:
     remaining = _remaining(deadline, stage)
+    if temporary_index is not None:
+        temporary_index.process_may_be_active = True
+        temporary_index.process_result = None
     try:
         result = run_process(
             argv=["git", *args],
@@ -241,6 +408,12 @@ def _git(
         )
     except BaseException as exc:
         process_result = getattr(exc, "process_result", None)
+        if temporary_index is not None:
+            if isinstance(process_result, ProcessResult):
+                temporary_index.process_result = process_result
+                temporary_index.process_may_be_active = not _termination_confirmed(process_result)
+            # With no result, a child may have been launched. Keep the exact
+            # temporary index and lock until termination can be confirmed.
         if isinstance(process_result, ProcessResult):
             reason = _process_failure_reason(process_result, deadline) or "incomplete-collection"
         else:
@@ -256,6 +429,12 @@ def _git(
         )
         raise
 
+    if temporary_index is not None:
+        if isinstance(result, ProcessResult):
+            temporary_index.process_result = result
+            temporary_index.process_may_be_active = not _termination_confirmed(result)
+        else:
+            temporary_index.process_may_be_active = True
     if not isinstance(result, ProcessResult):
         _raise_git_failure(
             "incomplete-collection",
@@ -271,7 +450,6 @@ def _git(
             stdout_limit_bytes=stdout_limit_bytes,
         )
     return result.stdout
-
 
 def _require_object_id(output: str, stage: str) -> str:
     value = output.strip()
@@ -340,50 +518,230 @@ def capture_baseline(repo: Path) -> GitBaseline:
         raise
 
 
-@contextmanager
-def _temporary_index(*, prefix: str, cleanup_stage: str) -> Iterator[Path]:
-    fd, path_text = tempfile.mkstemp(prefix=prefix)
-    path = Path(path_text)
-    try:
-        os.close(fd)
-        yield path
-    except BaseException as original:
+@dataclass
+class _TemporaryIndex:
+    path: Path
+    lock_path: Path
+    process_may_be_active: bool = False
+    process_result: ProcessResult | None = None
+
+
+def _remove_owned_artifacts(
+    temporary_index: _TemporaryIndex,
+) -> tuple[int, int, BaseException | None]:
+    """Best-effort removal of only this collector's index and its exact lock."""
+    errors = 0
+    first_error: BaseException | None = None
+    paths = (temporary_index.lock_path, temporary_index.path)
+    for path in paths:
         try:
             path.unlink(missing_ok=True)
-        except BaseException as cleanup_error:
-            _attach_failure(
-                original,
-                _failure_metadata("cleanup-failed", cleanup_stage),
-                attribute="git_cleanup_failure",
+        except FileNotFoundError:
+            pass
+        except BaseException as exc:
+            errors += 1
+            first_error = first_error or exc
+
+    unresolved = 0
+    for path in paths:
+        try:
+            path.stat()
+        except FileNotFoundError:
+            continue
+        except BaseException as exc:
+            errors += 1
+            unresolved += 1
+            first_error = first_error or exc
+        else:
+            unresolved += 1
+    return errors, unresolved, first_error
+
+
+def _cleanup_temporary_index(
+    temporary_index: _TemporaryIndex,
+    *,
+    deadline: float,
+    stage: str,
+) -> GitFailureMetadata | None:
+    if temporary_index.process_may_be_active:
+        return _failure_metadata(
+            "termination-unconfirmed",
+            stage,
+            process_result=temporary_index.process_result,
+            temporary_artifact_unresolved_count=2,
+            temporary_artifact_cleanup_uncertain=True,
+        )
+
+    try:
+        errors, unresolved, first_error = _bounded_filesystem_call(
+            lambda: _remove_owned_artifacts(temporary_index),
+            deadline=deadline,
+            stage=stage,
+            pending_artifacts=2,
+            cleanup=True,
+            on_late_completion=lambda _value, _error: _remove_owned_artifacts(temporary_index),
+        )
+    except BaseException as exc:
+        failure = getattr(exc, "git_failure", None)
+        if isinstance(failure, GitFailureMetadata):
+            raise
+        failure = _failure_metadata(
+            "cleanup-failed",
+            stage,
+            cleanup_error_count=1,
+            temporary_artifact_unresolved_count=2,
+            temporary_artifact_cleanup_uncertain=True,
+        )
+        _attach_failure(exc, failure)
+        raise
+
+    if errors or unresolved:
+        failure = _failure_metadata(
+            "cleanup-failed",
+            stage,
+            cleanup_error_count=errors,
+            temporary_artifact_unresolved_count=unresolved,
+            temporary_artifact_cleanup_uncertain=bool(unresolved),
+        )
+        if first_error is not None:
+            _attach_failure(first_error, failure)
+            raise first_error
+        return failure
+    return None
+
+
+@contextmanager
+def _temporary_index(
+    *,
+    prefix: str,
+    deadline: float,
+    init_stage: str,
+    cleanup_stage: str,
+) -> Iterator[_TemporaryIndex]:
+    owner: _TemporaryIndex | None = None
+
+    def cleanup_late_creation(value, error) -> None:
+        nonlocal owner
+        if error is not None or not isinstance(value, tuple) or len(value) != 2:
+            return
+        fd, path_text = value
+        path = Path(path_text)
+        owner = _TemporaryIndex(path=path, lock_path=Path(str(path) + ".lock"))
+        try:
+            os.close(fd)
+        except BaseException:
+            pass
+        _remove_owned_artifacts(owner)
+
+    fd, path_text = _bounded_filesystem_call(
+        lambda: tempfile.mkstemp(prefix=prefix),
+        deadline=deadline,
+        stage=init_stage,
+        pending_artifacts=2,
+        on_late_completion=cleanup_late_creation,
+    )
+    path = Path(path_text)
+    owner = _TemporaryIndex(path=path, lock_path=Path(str(path) + ".lock"))
+
+    try:
+        _bounded_filesystem_call(
+            lambda: os.close(fd),
+            deadline=deadline,
+            stage=init_stage,
+            pending_artifacts=2,
+            on_late_completion=lambda _value, _error: _remove_owned_artifacts(owner),
+        )
+    except BaseException as original:
+        if not getattr(original, "git_filesystem_operation_pending", False):
+            try:
+                cleanup_failure = _cleanup_temporary_index(
+                    owner,
+                    deadline=deadline,
+                    stage=cleanup_stage,
+                )
+            except BaseException as cleanup_error:
+                cleanup_failure = getattr(cleanup_error, "git_failure", None)
+                if not isinstance(cleanup_failure, GitFailureMetadata):
+                    cleanup_failure = _failure_metadata(
+                        "cleanup-failed",
+                        cleanup_stage,
+                        cleanup_error_count=1,
+                        temporary_artifact_unresolved_count=2,
+                        temporary_artifact_cleanup_uncertain=True,
+                    )
+            if cleanup_failure is not None:
+                _attach_failure(original, cleanup_failure, attribute="git_cleanup_failure")
+        raise
+
+    try:
+        yield owner
+    except BaseException as original:
+        if getattr(original, "git_filesystem_operation_pending", False):
+            raise
+        try:
+            cleanup_failure = _cleanup_temporary_index(
+                owner,
+                deadline=deadline,
+                stage=cleanup_stage,
             )
+        except BaseException as cleanup_error:
+            cleanup_failure = getattr(cleanup_error, "git_failure", None)
+            if not isinstance(cleanup_failure, GitFailureMetadata):
+                cleanup_failure = _failure_metadata(
+                    "cleanup-failed",
+                    cleanup_stage,
+                    cleanup_error_count=1,
+                    temporary_artifact_unresolved_count=2,
+                    temporary_artifact_cleanup_uncertain=True,
+                )
+        if cleanup_failure is not None:
+            _attach_failure(original, cleanup_failure, attribute="git_cleanup_failure")
         raise
     else:
-        try:
-            path.unlink(missing_ok=True)
-        except BaseException as cleanup_error:
-            _attach_failure(
-                cleanup_error,
-                _failure_metadata("cleanup-failed", cleanup_stage),
-            )
-            raise
+        cleanup_failure = _cleanup_temporary_index(
+            owner,
+            deadline=deadline,
+            stage=cleanup_stage,
+        )
+        if cleanup_failure is not None:
+            raise GitCollectionError(cleanup_failure)
 
 
-def _copy_index(index_path: Path, temporary_index: Path, *, deadline: float) -> None:
+def _copy_index_sync(
+    index_path: Path,
+    temporary_index: _TemporaryIndex,
+    *,
+    deadline: float,
+) -> None:
     _remaining(deadline, "cumulative-patch-index-copy")
-    if not index_path.exists():
-        temporary_index.write_bytes(b"")
+    try:
+        index_path.stat()
+    except FileNotFoundError:
+        with temporary_index.path.open("wb"):
+            pass
         _remaining(deadline, "cumulative-patch-index-copy")
         return
 
-    with index_path.open("rb") as source, temporary_index.open("wb") as target:
+    with index_path.open("rb") as source, temporary_index.path.open("wb") as target:
         while True:
             _remaining(deadline, "cumulative-patch-index-copy")
             chunk = source.read(_INDEX_COPY_CHUNK_BYTES)
             if not chunk:
                 break
-            target.write(chunk)
+            written = target.write(chunk)
+            if written != len(chunk):
+                raise OSError("incomplete temporary-index copy")
     _remaining(deadline, "cumulative-patch-index-copy")
 
+
+def _copy_index(index_path: Path, temporary_index: _TemporaryIndex, *, deadline: float) -> None:
+    _bounded_filesystem_call(
+        lambda: _copy_index_sync(index_path, temporary_index, deadline=deadline),
+        deadline=deadline,
+        stage="cumulative-patch-index-copy",
+        pending_artifacts=2,
+        on_late_completion=lambda _value, _error: _remove_owned_artifacts(temporary_index),
+    )
 
 def _capture_patch_with_untracked(
     *,
@@ -405,16 +763,19 @@ def _capture_patch_with_untracked(
 
     index_path = Path(index_path_text)
     if not index_path.is_absolute():
-        index_path = (repo / index_path).resolve()
+        index_path = Path(os.path.abspath(os.fspath(repo / index_path)))
 
+    init_stage = "cumulative-patch-index-init"
     _remaining(deadline, "cumulative-patch-index-copy")
     with _temporary_index(
         prefix="coding-agent-harness-index-",
+        deadline=deadline,
+        init_stage=init_stage,
         cleanup_stage="cumulative-patch-index-cleanup",
     ) as temporary_index:
         _copy_index(index_path, temporary_index, deadline=deadline)
         env = os.environ.copy()
-        env["GIT_INDEX_FILE"] = str(temporary_index)
+        env["GIT_INDEX_FILE"] = str(temporary_index.path)
 
         if untracked_files:
             _git(
@@ -425,6 +786,7 @@ def _capture_patch_with_untracked(
                 env=env,
                 deadline=deadline,
                 stage="cumulative-patch-index-add",
+                temporary_index=temporary_index,
             )
 
         return _git(
@@ -439,8 +801,8 @@ def _capture_patch_with_untracked(
             deadline=deadline,
             stage="cumulative-patch",
             stdout_limit_bytes=GIT_PATCH_STDOUT_LIMIT_BYTES,
+            temporary_index=temporary_index,
         )
-
 
 def capture_evidence(*, repo: Path, baseline: GitBaseline) -> GitEvidence:
     partial = {"baseline_commit": baseline.commit}
@@ -530,14 +892,21 @@ def _capture_worktree_tree(
     stage_prefix: str,
 ) -> str:
     env = os.environ.copy()
+    init_stage = f"{stage_prefix}-index-init"
     with _temporary_index(
         prefix="coding-agent-harness-snapshot-index-",
+        deadline=deadline,
+        init_stage=init_stage,
         cleanup_stage=f"{stage_prefix}-cleanup",
     ) as temporary_index:
-        stage = f"{stage_prefix}-index-init"
-        _remaining(deadline, stage)
-        temporary_index.unlink(missing_ok=True)
-        env["GIT_INDEX_FILE"] = str(temporary_index)
+        _bounded_filesystem_call(
+            lambda: temporary_index.path.unlink(missing_ok=True),
+            deadline=deadline,
+            stage=init_stage,
+            pending_artifacts=2,
+            on_late_completion=lambda _value, _error: _remove_owned_artifacts(temporary_index),
+        )
+        env["GIT_INDEX_FILE"] = str(temporary_index.path)
 
         _git(
             repo,
@@ -546,6 +915,7 @@ def _capture_worktree_tree(
             env=env,
             deadline=deadline,
             stage=f"{stage_prefix}-read-tree",
+            temporary_index=temporary_index,
         )
 
         _git(
@@ -557,6 +927,7 @@ def _capture_worktree_tree(
             env=env,
             deadline=deadline,
             stage=f"{stage_prefix}-add",
+            temporary_index=temporary_index,
         )
 
         tree = _require_object_id(
@@ -566,6 +937,7 @@ def _capture_worktree_tree(
                 env=env,
                 deadline=deadline,
                 stage=f"{stage_prefix}-write-tree",
+                temporary_index=temporary_index,
             ),
             f"{stage_prefix}-write-tree",
         )
@@ -573,7 +945,6 @@ def _capture_worktree_tree(
 
     _remaining(deadline, f"{stage_prefix}-cleanup")
     return tree
-
 
 def capture_worktree_snapshot(repo: Path) -> GitWorktreeSnapshot:
     partial: dict = {}

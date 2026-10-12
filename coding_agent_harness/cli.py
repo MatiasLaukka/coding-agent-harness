@@ -251,10 +251,17 @@ def _git_failure_summary(metadata: object) -> dict:
         value = getattr(metadata, name)
         if type(value) is bool:
             result[name] = value
-    for name in ("cleanup_error_count", "surviving_process_count"):
+    for name in (
+        "cleanup_error_count",
+        "surviving_process_count",
+        "filesystem_operation_pending_count",
+        "temporary_artifact_unresolved_count",
+    ):
         value = getattr(metadata, name)
         if type(value) is int and 0 <= value <= 1_000_000:
             result[name] = value
+    if type(metadata.temporary_artifact_cleanup_uncertain) is bool:
+        result["temporary_artifact_cleanup_uncertain"] = metadata.temporary_artifact_cleanup_uncertain
     return result
 
 

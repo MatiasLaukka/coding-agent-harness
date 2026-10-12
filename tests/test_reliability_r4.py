@@ -244,6 +244,58 @@ def _make_git_repo(tmp_path: Path) -> Path:
     return repo
 
 
+def _configure_slow_git_clean_filter(repo: Path, root: Path) -> tuple[Path, Path]:
+    import sys
+
+    marker = root / "slow-filter-marker.json"
+    release = root / "slow-filter-release"
+    script = root / "slow_clean_filter.py"
+    script.write_text(
+        "import json, os, time\n"
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text(json.dumps({{'pid': os.getpid(), 'index': os.environ.get('GIT_INDEX_FILE')}}))\n"
+        f"release = Path({str(release)!r})\n"
+        "while not release.exists(): time.sleep(0.01)\n",
+        encoding="utf-8",
+    )
+    command = f'"{sys.executable.replace(chr(92), "/")}" "{str(script).replace(chr(92), "/")}"'
+    _git_command(repo, "config", "filter.r4.clean", command)
+    _git_command(repo, "config", "filter.r4.required", "true")
+    (repo / ".gitattributes").write_text("payload.txt filter=r4\n", encoding="utf-8")
+    (repo / "payload.txt").write_text("slow input\n", encoding="utf-8")
+    return marker, release
+
+
+def _capture_snapshot_with_outer_deadline(repo: Path, release: Path) -> None:
+    import threading
+
+    done = threading.Event()
+    result = []
+
+    def capture() -> None:
+        try:
+            git_module.capture_worktree_snapshot(repo)
+        except BaseException as exc:
+            result.append(exc)
+        else:
+            result.append(None)
+        finally:
+            done.set()
+
+    caller = threading.Thread(target=capture, daemon=True)
+    caller.start()
+    try:
+        if not done.wait(8.0):
+            release.touch()
+            assert done.wait(2.0), "snapshot exceeded its independent outer safety deadline"
+            pytest.fail("snapshot exceeded its independent outer safety deadline")
+        assert result and isinstance(result[0], BaseException), "slow filter unexpectedly completed successfully"
+        raise result[0]
+    finally:
+        release.touch()
+        caller.join(timeout=1.0)
+
+
 def _fake_process_result(argv, **overrides) -> ProcessResult:
     values = dict(
         argv=list(argv),
@@ -471,6 +523,384 @@ def test_snapshot_timeout_cleans_temporary_index_and_preserves_real_index(
     assert real_index.read_bytes() == real_index_bytes
     assert envs
     assert all(Path(env["GIT_INDEX_FILE"]) == temporary_indexes[0] for env in envs)
+
+
+def test_blocked_snapshot_cleanup_returns_by_deadline_with_partial_tree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import threading
+
+    repo = _make_git_repo(tmp_path)
+    real_index = repo / _git_command(repo, "rev-parse", "--git-path", "index")
+    index_bytes = real_index.read_bytes()
+    monkeypatch.setattr(git_module, "SNAPSHOT_TIMEOUT_SECONDS", 0.25)
+    monkeypatch.setattr(git_module, "PROCESS_CLEANUP_RESERVE_SECONDS", 0.05, raising=False)
+    real_mkstemp = git_module.tempfile.mkstemp
+    temporary_indexes = []
+
+    def record_temp(prefix):
+        fd, name = real_mkstemp(prefix=prefix, dir=tmp_path)
+        temporary_indexes.append(Path(name))
+        return fd, name
+
+    monkeypatch.setattr(git_module.tempfile, "mkstemp", record_temp)
+
+    def fake_git(repo_path, *args, **kwargs):
+        return "a" * 40 + "\n" if args[0] == "write-tree" else ""
+
+    monkeypatch.setattr(git_module, "_git", fake_git)
+    original_unlink = Path.unlink
+    entered = threading.Event()
+    release = threading.Event()
+    calls = {}
+
+    def block_final_index_delete(path, *args, **kwargs):
+        if path in temporary_indexes:
+            calls[path] = calls.get(path, 0) + 1
+            if calls[path] == 2:
+                entered.set()
+                release.wait()
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", block_final_index_delete)
+    result = []
+
+    def capture():
+        try:
+            result.append(git_module.capture_worktree_snapshot(repo))
+        except BaseException as exc:
+            result.append(exc)
+
+    caller = threading.Thread(target=capture, daemon=True)
+    caller.start()
+    returned_by_outer_deadline = False
+    try:
+        assert entered.wait(0.5), "snapshot did not reach final index cleanup"
+        caller.join(timeout=0.75)
+        returned_by_outer_deadline = not caller.is_alive()
+    finally:
+        release.set()
+        caller.join(timeout=1.0)
+
+    assert returned_by_outer_deadline, "blocked unlink held the collection caller past its phase deadline"
+    assert isinstance(result[0], git_module.GitCollectionError)
+    assert _reason(result[0]) == "deadline-exceeded"
+    assert _partial(result[0])["tree"] == "a" * 40
+    assert result[0].git_failure.filesystem_operation_pending_count == 1
+    assert result[0].git_failure.temporary_artifact_unresolved_count == 2
+    assert real_index.read_bytes() == index_bytes
+
+
+def test_blocked_temporary_index_creation_is_bounded_and_late_creation_cannot_succeed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import threading
+
+    repo = _make_git_repo(tmp_path)
+    monkeypatch.setattr(git_module, "SNAPSHOT_TIMEOUT_SECONDS", 0.3)
+    monkeypatch.setattr(git_module, "PROCESS_CLEANUP_RESERVE_SECONDS", 0.05, raising=False)
+    real_mkstemp = git_module.tempfile.mkstemp
+    temporary_indexes = []
+    entered = threading.Event()
+    release = threading.Event()
+    late_cleanup_done = threading.Event()
+    original_unlink = Path.unlink
+
+    def blocked_mkstemp(prefix):
+        fd, name = real_mkstemp(prefix=prefix, dir=tmp_path)
+        temporary_indexes.append(Path(name))
+        entered.set()
+        release.wait()
+        return fd, name
+
+    def observe_cleanup(path, *args, **kwargs):
+        result = original_unlink(path, *args, **kwargs)
+        if temporary_indexes and path == temporary_indexes[0]:
+            late_cleanup_done.set()
+        return result
+
+    monkeypatch.setattr(git_module.tempfile, "mkstemp", blocked_mkstemp)
+    monkeypatch.setattr(Path, "unlink", observe_cleanup)
+    result = []
+
+    def capture():
+        try:
+            result.append(git_module.capture_worktree_snapshot(repo))
+        except BaseException as exc:
+            result.append(exc)
+
+    caller = threading.Thread(target=capture, daemon=True)
+    caller.start()
+    returned_by_outer_deadline = False
+    try:
+        assert entered.wait(0.5), "temporary-index creation did not start"
+        assert temporary_indexes[0].exists()
+        caller.join(timeout=0.75)
+        returned_by_outer_deadline = not caller.is_alive()
+    finally:
+        release.set()
+        caller.join(timeout=1.0)
+
+    assert returned_by_outer_deadline, "blocked creation held the collection caller past its phase deadline"
+    assert isinstance(result[0], git_module.GitCollectionError)
+    assert _reason(result[0]) == "deadline-exceeded"
+    assert result[0].git_failure.filesystem_operation_pending_count == 1
+    assert result[0].git_failure.temporary_artifact_cleanup_uncertain is True
+    assert late_cleanup_done.wait(1.0)
+    assert not temporary_indexes[0].exists()
+
+
+@pytest.mark.parametrize("blocked_operation", ["source-open", "source-read", "target-open", "target-write"])
+def test_blocked_temporary_index_copy_io_is_bounded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    blocked_operation: str,
+) -> None:
+    import threading
+
+    repo = _make_git_repo(tmp_path)
+    head = _git_command(repo, "rev-parse", "HEAD")
+    source_index = repo / ".git" / "index"
+    monkeypatch.setattr(git_module, "CUMULATIVE_TIMEOUT_SECONDS", 0.4)
+    monkeypatch.setattr(git_module, "PROCESS_CLEANUP_RESERVE_SECONDS", 0.05, raising=False)
+    real_open = Path.open
+    entered = threading.Event()
+    release = threading.Event()
+    late_cleanup_done = threading.Event()
+    temporary_indexes = []
+    real_mkstemp = git_module.tempfile.mkstemp
+    original_unlink = Path.unlink
+
+    def record_temp(prefix):
+        fd, name = real_mkstemp(prefix=prefix, dir=tmp_path)
+        temporary_indexes.append(Path(name))
+        return fd, name
+
+    def fake_git(repo_path, *args, **kwargs):
+        if args[0] == "rev-parse" and args[1:] == ("HEAD",):
+            return head + "\n"
+        if args[0] == "rev-parse" and args[1:] == ("--git-path", "index"):
+            return ".git/index\n"
+        if args[0] == "log":
+            return ""
+        return ""
+
+    class GateFile:
+        def __init__(self, wrapped, method):
+            self.wrapped = wrapped
+            self.method = method
+
+        def __enter__(self):
+            self.wrapped.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self.wrapped.__exit__(*args)
+
+        def read(self, *args, **kwargs):
+            if self.method == "read":
+                entered.set()
+                release.wait()
+            return self.wrapped.read(*args, **kwargs)
+
+        def write(self, *args, **kwargs):
+            if self.method == "write":
+                entered.set()
+                release.wait()
+            return self.wrapped.write(*args, **kwargs)
+
+    def gated_open(path, *args, **kwargs):
+        mode = args[0] if args else kwargs.get("mode", "r")
+        is_source = path == source_index and mode == "rb"
+        is_target = path.name.startswith("coding-agent-harness-index-") and mode == "wb"
+        if blocked_operation == "source-open" and is_source:
+            entered.set()
+            release.wait()
+        if blocked_operation == "target-open" and is_target:
+            entered.set()
+            release.wait()
+        wrapped = real_open(path, *args, **kwargs)
+        if blocked_operation == "source-read" and is_source:
+            return GateFile(wrapped, "read")
+        if blocked_operation == "target-write" and is_target:
+            return GateFile(wrapped, "write")
+        return wrapped
+
+    def observe_cleanup(path, *args, **kwargs):
+        result = original_unlink(path, *args, **kwargs)
+        if temporary_indexes and path == temporary_indexes[0]:
+            late_cleanup_done.set()
+        return result
+
+    monkeypatch.setattr(git_module, "_git", fake_git)
+    monkeypatch.setattr(git_module.tempfile, "mkstemp", record_temp)
+    monkeypatch.setattr(Path, "open", gated_open)
+    monkeypatch.setattr(Path, "unlink", observe_cleanup)
+    baseline = git_module.GitBaseline(commit=head, status="")
+    result = []
+
+    def capture():
+        try:
+            result.append(git_module.capture_evidence(repo=repo, baseline=baseline))
+        except BaseException as exc:
+            result.append(exc)
+
+    caller = threading.Thread(target=capture, daemon=True)
+    caller.start()
+    returned_by_outer_deadline = False
+    try:
+        assert entered.wait(0.6), f"copy did not reach blocked {blocked_operation}"
+        caller.join(timeout=0.8)
+        returned_by_outer_deadline = not caller.is_alive()
+    finally:
+        release.set()
+        caller.join(timeout=1.0)
+
+    assert returned_by_outer_deadline, f"blocked {blocked_operation} held the collection caller"
+    assert isinstance(result[0], git_module.GitCollectionError)
+    assert _reason(result[0]) == "deadline-exceeded"
+    assert _partial(result[0])["final_head"] == head
+    assert _partial(result[0])["changed_files"] == []
+    assert "patch" not in _partial(result[0])
+    assert result[0].git_failure.filesystem_operation_pending_count == 1
+    assert late_cleanup_done.wait(1.0)
+    assert not temporary_indexes[0].exists()
+
+
+def test_real_timed_out_git_add_removes_owned_index_lock_without_changing_real_index(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = _make_git_repo(tmp_path)
+    _, release = _configure_slow_git_clean_filter(repo, tmp_path)
+    real_index = repo / _git_command(repo, "rev-parse", "--git-path", "index")
+    real_index_bytes = real_index.read_bytes()
+    real_mkstemp = git_module.tempfile.mkstemp
+    temporary_indexes = []
+
+    def record_temp(prefix):
+        fd, name = real_mkstemp(prefix=prefix, dir=tmp_path)
+        temporary_indexes.append(Path(name))
+        return fd, name
+
+    monkeypatch.setattr(git_module.tempfile, "mkstemp", record_temp)
+    monkeypatch.setattr(git_module, "SNAPSHOT_TIMEOUT_SECONDS", 4)
+    try:
+        for _ in range(2):
+            release.unlink(missing_ok=True)
+            with pytest.raises(git_module.GitCollectionError) as caught:
+                _capture_snapshot_with_outer_deadline(repo, release)
+            assert _reason(caught.value) == "deadline-exceeded"
+            assert caught.value.process_result.cleanup_attempted is True
+            assert caught.value.process_result.cleanup_errors == []
+            assert caught.value.process_result.surviving_pids == []
+            assert caught.value.process_result.exit_code is not None
+            temporary_index = temporary_indexes[-1]
+            assert not temporary_index.exists()
+            assert not Path(str(temporary_index) + ".lock").exists()
+            assert not list(tmp_path.glob("coding-agent-harness-snapshot-index-*.lock"))
+            assert real_index.read_bytes() == real_index_bytes
+    finally:
+        release.touch()
+
+    assert len(temporary_indexes) == 2
+
+
+def test_failed_owned_index_lock_deletion_is_reported(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = _make_git_repo(tmp_path)
+    _, release = _configure_slow_git_clean_filter(repo, tmp_path)
+    real_index = repo / _git_command(repo, "rev-parse", "--git-path", "index")
+    real_index_bytes = real_index.read_bytes()
+    real_mkstemp = git_module.tempfile.mkstemp
+    temporary_indexes = []
+
+    def record_temp(prefix):
+        fd, name = real_mkstemp(prefix=prefix, dir=tmp_path)
+        temporary_indexes.append(Path(name))
+        return fd, name
+
+    monkeypatch.setattr(git_module.tempfile, "mkstemp", record_temp)
+    monkeypatch.setattr(git_module, "SNAPSHOT_TIMEOUT_SECONDS", 4)
+    original_unlink = Path.unlink
+    lock_error = OSError("private lock deletion failure")
+
+    def fail_owned_lock(path, *args, **kwargs):
+        if temporary_indexes and path == Path(str(temporary_indexes[-1]) + ".lock"):
+            raise lock_error
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_owned_lock)
+    try:
+        with pytest.raises(git_module.GitCollectionError) as caught:
+            _capture_snapshot_with_outer_deadline(repo, release)
+        assert _reason(caught.value) == "deadline-exceeded"
+        cleanup = caught.value.git_cleanup_failure
+        assert cleanup.reason == "cleanup-failed"
+        assert cleanup.cleanup_error_count == 1
+        assert cleanup.temporary_artifact_unresolved_count == 1
+        assert not temporary_indexes[0].exists()
+        assert Path(str(temporary_indexes[0]) + ".lock").exists()
+        assert real_index.read_bytes() == real_index_bytes
+    finally:
+        release.touch()
+        monkeypatch.setattr(Path, "unlink", original_unlink)
+        if temporary_indexes:
+            original_unlink(Path(str(temporary_indexes[0]) + ".lock"), missing_ok=True)
+
+
+def test_unconfirmed_git_process_preserves_owned_index_and_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = _make_git_repo(tmp_path)
+    real_index = repo / _git_command(repo, "rev-parse", "--git-path", "index")
+    real_index_bytes = real_index.read_bytes()
+    temporary_indexes = []
+    real_mkstemp = git_module.tempfile.mkstemp
+
+    def record_temp(prefix):
+        fd, name = real_mkstemp(prefix=prefix, dir=tmp_path)
+        temporary_indexes.append(Path(name))
+        return fd, name
+
+    monkeypatch.setattr(git_module.tempfile, "mkstemp", record_temp)
+
+    def run(kwargs):
+        args = kwargs["argv"][1:]
+        temporary_index = Path(kwargs["env"]["GIT_INDEX_FILE"])
+        if args[0] == "read-tree":
+            temporary_index.write_bytes(b"owned temporary index")
+            return _fake_process_result(kwargs["argv"])
+        if args[0] == "add":
+            Path(str(temporary_index) + ".lock").write_bytes(b"git may still own this lock")
+            return _fake_process_result(
+                kwargs["argv"],
+                exit_code=None,
+                timed_out=True,
+                output_complete=False,
+                cleanup_attempted=True,
+                cleanup_errors=["cleanup-deadline"],
+                surviving_pids=[4242],
+            )
+        return _fake_process_result(kwargs["argv"], stdout="b" * 40 + "\n")
+
+    _fake_git_runner(monkeypatch, run)
+    with pytest.raises(git_module.GitCollectionError) as caught:
+        git_module.capture_worktree_snapshot(repo)
+
+    temporary_index = temporary_indexes[0]
+    lock = Path(str(temporary_index) + ".lock")
+    assert caught.value.process_result.surviving_pids == [4242]
+    assert caught.value.git_cleanup_failure.reason == "termination-unconfirmed"
+    assert caught.value.git_cleanup_failure.temporary_artifact_unresolved_count == 2
+    assert temporary_index.exists()
+    assert lock.exists()
+    assert real_index.read_bytes() == real_index_bytes
 
 
 def test_snapshot_commands_share_one_deadline_and_leave_real_index_unchanged(
@@ -1156,6 +1586,9 @@ def test_cli_failure_summary_allowlists_git_metadata_without_raw_payloads(
         stdout_limit_bytes=git_module.GIT_PATCH_STDOUT_LIMIT_BYTES,
         stderr_limit_bytes=git_module.GIT_STDERR_LIMIT_BYTES,
         stdout_truncated=True,
+        filesystem_operation_pending_count=1,
+        temporary_artifact_unresolved_count=2,
+        temporary_artifact_cleanup_uncertain=True,
     )
     failure.git_evidence = {
         "baseline_commit": "a" * 40,
@@ -1184,6 +1617,9 @@ def test_cli_failure_summary_allowlists_git_metadata_without_raw_payloads(
     assert payload["git_failure"]["stage"] == "cumulative-patch"
     assert payload["git_failure"]["stdout_limit_bytes"] == 8 * 1024 * 1024
     assert payload["git_failure"]["stdout_truncated"] is True
+    assert payload["git_failure"]["filesystem_operation_pending_count"] == 1
+    assert payload["git_failure"]["temporary_artifact_unresolved_count"] == 2
+    assert payload["git_failure"]["temporary_artifact_cleanup_uncertain"] is True
     assert payload["failure_type"] == "RuntimeError"
     for private in (
         "PRIVATE_EXCEPTION_MESSAGE",
