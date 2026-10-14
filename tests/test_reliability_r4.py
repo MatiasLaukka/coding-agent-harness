@@ -217,6 +217,39 @@ from coding_agent_harness.process import ProcessResult
 from coding_agent_harness.worker import WorkerRunResult
 
 
+def _run_isolated_python_probe(tmp_path: Path, source: str, *, timeout: float = 8.0) -> dict:
+    import sys
+
+    child = subprocess.Popen(
+        [sys.executable, "-c", source, str(tmp_path)],
+        cwd=Path(__file__).resolve().parents[1],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        stdout, stderr = child.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        if child.poll() is None:
+            child.kill()
+        try:
+            stdout, stderr = child.communicate(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            if child.poll() is None:
+                child.kill()
+            child.wait(timeout=2.0)
+            pytest.fail(
+                "isolated cancellation probe did not terminate after killing its "
+                f"own child process (pid={child.pid})"
+            )
+        pytest.fail(
+            "isolated cancellation probe exceeded its independent outer deadline; "
+            f"child pid={child.pid}, stdout={stdout!r}, stderr={stderr!r}"
+        )
+    assert child.returncode == 0, f"isolated probe failed: {stderr}"
+    return json.loads(stdout.strip().splitlines()[-1])
+
+
 def _git_command(repo: Path, *args: str, timeout: float = 10) -> str:
     result = subprocess.run(
         ["git", *args],
@@ -650,6 +683,293 @@ def test_blocked_temporary_index_creation_is_bounded_and_late_creation_cannot_su
     assert result[0].git_failure.temporary_artifact_cleanup_uncertain is True
     assert late_cleanup_done.wait(1.0)
     assert not temporary_indexes[0].exists()
+
+
+def test_interrupted_thread_start_keeps_helper_owned_until_late_cleanup(
+    tmp_path: Path,
+) -> None:
+    import textwrap
+
+    probe = textwrap.dedent(
+        r"""
+        import json, signal, sys, threading, time
+        from pathlib import Path
+        import coding_agent_harness.git as git_module
+
+        root = Path(sys.argv[1])
+        source = root / "source-index"
+        target = root / "temporary-index"
+        source.write_bytes(b"copied after caller cancellation")
+        owner = git_module._TemporaryIndex(
+            path=target,
+            lock_path=Path(str(target) + ".lock"),
+            artifact_state="owned",
+        )
+        entered = threading.Event()
+        release = threading.Event()
+        operation_finished = threading.Event()
+        cleanup_finished = threading.Event()
+        interruption = KeyboardInterrupt("sentinel")
+        helpers = []
+        real_start = threading.Thread.start
+        real_open = Path.open
+        real_copy = git_module._copy_index_sync
+        real_cleanup = git_module._remove_owned_artifacts
+
+        def signal_handler(_signum, _frame):
+            raise interruption
+
+        signal.signal(signal.SIGINT, signal_handler)
+
+        def interrupted_start(self, *args, **kwargs):
+            result = real_start(self, *args, **kwargs)
+            if self.name == "harness-git-filesystem":
+                helpers.append(self)
+                if not entered.wait(2.0):
+                    raise RuntimeError("copy did not reach its source open")
+                signal.raise_signal(signal.SIGINT)
+            return result
+
+        threading.Thread.start = interrupted_start
+
+        def blocked_source_open(path, *args, **kwargs):
+            mode = args[0] if args else kwargs.get("mode", "r")
+            if path == source and mode == "rb":
+                entered.set()
+                release.wait(2.0)
+            return real_open(path, *args, **kwargs)
+
+        def observed_copy(*args, **kwargs):
+            try:
+                return real_copy(*args, **kwargs)
+            finally:
+                operation_finished.set()
+
+        def observed_cleanup(temporary_index):
+            result = real_cleanup(temporary_index)
+            cleanup_finished.set()
+            return result
+
+        Path.open = blocked_source_open
+        git_module._copy_index_sync = observed_copy
+        git_module._remove_owned_artifacts = observed_cleanup
+
+        try:
+            git_module._copy_index(source, owner, deadline=time.monotonic() + 4.0)
+            caught = None
+        except BaseException as exc:
+            caught = exc
+
+        failure = getattr(caught, "git_failure", None)
+        alive_at_cancel = any(helper.is_alive() for helper in helpers)
+        release.set()
+        finished = operation_finished.wait(1.5)
+        cleaned = cleanup_finished.wait(1.5)
+        print(json.dumps({
+            "identity_preserved": caught is interruption,
+            "pending": getattr(failure, "filesystem_operation_pending_count", None),
+            "unresolved": getattr(failure, "temporary_artifact_unresolved_count", None),
+            "uncertain": getattr(failure, "temporary_artifact_cleanup_uncertain", None),
+            "helper_alive_at_cancel": alive_at_cancel,
+            "operation_finished": finished,
+            "cleanup_finished": cleaned,
+            "artifact_exists_after_cleanup": target.exists(),
+            "helper_alive_after_cleanup": any(helper.is_alive() for helper in helpers),
+        }))
+        """
+    )
+    result = _run_isolated_python_probe(tmp_path, probe)
+
+    assert result["identity_preserved"] is True
+    assert result["helper_alive_at_cancel"] is True
+    assert result["pending"] == 1
+    assert result["unresolved"] == 2
+    assert result["uncertain"] is True
+    assert result["operation_finished"] is True
+    assert result["cleanup_finished"] is True
+    assert result["artifact_exists_after_cleanup"] is False
+    assert result["helper_alive_after_cleanup"] is False
+
+
+def test_interrupted_temporary_file_creation_retains_descriptor_and_path_ownership(
+    tmp_path: Path,
+) -> None:
+    import textwrap
+
+    probe = textwrap.dedent(
+        r"""
+        import json, os, signal, sys, tempfile, threading, time
+        from pathlib import Path
+        import coding_agent_harness.git as git_module
+
+        root = Path(sys.argv[1])
+        created = threading.Event()
+        cleanup_finished = threading.Event()
+        records = []
+        interruption = KeyboardInterrupt("creation-handoff")
+        real_mkstemp = tempfile.mkstemp
+        real_start = threading.Thread.start
+        real_cleanup = git_module._remove_owned_artifacts
+
+        def signal_handler(_signum, _frame):
+            raise interruption
+
+        signal.signal(signal.SIGINT, signal_handler)
+
+        def owned_mkstemp(prefix):
+            fd, name = real_mkstemp(prefix=prefix, dir=root)
+            records.append((fd, name))
+            created.set()
+            return fd, name
+
+        def observe_cleanup(owner):
+            result = real_cleanup(owner)
+            cleanup_finished.set()
+            return result
+
+        git_module.tempfile.mkstemp = owned_mkstemp
+        git_module._remove_owned_artifacts = observe_cleanup
+
+        def interrupted_start(self, *args, **kwargs):
+            result = real_start(self, *args, **kwargs)
+            if self.name == "harness-git-filesystem":
+                if not created.wait(2.0):
+                    raise RuntimeError("temporary creation did not complete")
+                signal.raise_signal(signal.SIGINT)
+            return result
+
+        threading.Thread.start = interrupted_start
+
+        try:
+            with git_module._temporary_index(
+                prefix="ownership-probe-",
+                deadline=time.monotonic() + 4.0,
+                init_stage="ownership-probe-init",
+                cleanup_stage="ownership-probe-cleanup",
+            ):
+                raise AssertionError("interrupted creation must not yield an index")
+            caught = None
+        except BaseException as exc:
+            caught = exc
+
+        failure = getattr(caught, "git_failure", None)
+        cleaned = cleanup_finished.wait(1.5)
+        fd, name = records[0]
+        try:
+            os.fstat(fd)
+            descriptor_open = True
+        except OSError:
+            descriptor_open = False
+        print(json.dumps({
+            "identity_preserved": caught is interruption,
+            "pending": getattr(failure, "filesystem_operation_pending_count", None),
+            "unresolved": getattr(failure, "temporary_artifact_unresolved_count", None),
+            "uncertain": getattr(failure, "temporary_artifact_cleanup_uncertain", None),
+            "cleanup_finished": cleaned,
+            "descriptor_open": descriptor_open,
+            "temporary_path_exists": Path(name).exists(),
+        }))
+        """
+    )
+    result = _run_isolated_python_probe(tmp_path, probe)
+
+    assert result["identity_preserved"] is True
+    assert result["pending"] == 1
+    assert result["unresolved"] == 2
+    assert result["uncertain"] is True
+    assert result["cleanup_finished"] is True
+    assert result["descriptor_open"] is False
+    assert result["temporary_path_exists"] is False
+
+
+def test_cleanup_deadline_before_helper_start_reports_owned_paths_as_uncertain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import threading
+    import types
+
+    temporary_index_path = tmp_path / "owned-index"
+    temporary_lock_path = Path(str(temporary_index_path) + ".lock")
+    temporary_index_path.write_bytes(b"owned index")
+    temporary_lock_path.write_bytes(b"owned lock")
+    owner = git_module._TemporaryIndex(
+        path=temporary_index_path,
+        lock_path=temporary_lock_path,
+    )
+    starts = []
+    real_start = threading.Thread.start
+
+    def observe_start(thread, *args, **kwargs):
+        starts.append(thread.name)
+        return real_start(thread, *args, **kwargs)
+
+    monkeypatch.setattr(threading.Thread, "start", observe_start)
+    monkeypatch.setattr(
+        git_module,
+        "time",
+        types.SimpleNamespace(monotonic=lambda: 20.0),
+    )
+
+    with pytest.raises(git_module.GitCollectionError) as caught:
+        git_module._cleanup_temporary_index(
+            owner,
+            deadline=19.0,
+            stage="cleanup-before-launch",
+        )
+
+    assert starts == []
+    assert caught.value.git_failure.reason == "deadline-exceeded"
+    assert caught.value.git_failure.filesystem_operation_pending_count == 0
+    assert caught.value.git_failure.temporary_artifact_unresolved_count == 2
+    assert caught.value.git_failure.temporary_artifact_cleanup_uncertain is True
+    assert temporary_index_path.exists()
+    assert temporary_lock_path.exists()
+
+
+def test_uncertain_descriptor_close_is_not_retried_or_reported_clean(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    descriptor, name = git_module.tempfile.mkstemp(
+        prefix="uncertain-close-",
+        dir=tmp_path,
+    )
+    path = Path(name)
+    owner = git_module._TemporaryIndex(
+        path=path,
+        lock_path=Path(str(path) + ".lock"),
+        descriptor=descriptor,
+        artifact_state="owned",
+    )
+    real_close = os.close
+    close_calls = []
+    close_error = OSError("ambiguous descriptor close")
+
+    def fail_close(actual_descriptor: int) -> None:
+        assert actual_descriptor == descriptor
+        close_calls.append(actual_descriptor)
+        raise close_error
+
+    monkeypatch.setattr(git_module.os, "close", fail_close)
+    try:
+        errors, unresolved, first_error = git_module._remove_owned_artifacts(owner)
+        assert errors >= 1
+        assert unresolved >= 1
+        assert first_error is close_error
+        assert owner.descriptor is None
+        assert owner.descriptor_uncertain is True
+
+        _second_errors, second_unresolved, _second_error = (
+            git_module._remove_owned_artifacts(owner)
+        )
+        assert close_calls == [descriptor]
+        assert second_unresolved >= 1
+    finally:
+        monkeypatch.setattr(git_module.os, "close", real_close)
+        real_close(descriptor)
+        path.unlink(missing_ok=True)
+        Path(str(path) + ".lock").unlink(missing_ok=True)
 
 
 @pytest.mark.parametrize("blocked_operation", ["source-open", "source-read", "target-open", "target-write"])
