@@ -1148,9 +1148,36 @@ def test_failed_owned_index_lock_deletion_is_reported(
     monkeypatch.setattr(git_module, "SNAPSHOT_TIMEOUT_SECONDS", 4)
     original_unlink = Path.unlink
     lock_error = OSError("private lock deletion failure")
+    original_remove_owned_artifacts = git_module._remove_owned_artifacts
+    prepared_lock_paths = []
+    lock_preexisting_states = []
+
+    def ensure_owned_lock_at_cleanup(temporary_index):
+        lock_path = temporary_index.lock_path
+        if (
+            not prepared_lock_paths
+            and temporary_index.path is not None
+            and lock_path is not None
+            and temporary_indexes
+            and temporary_index.path == temporary_indexes[-1]
+        ):
+            # Cleanup calls this helper only after Git termination is confirmed.
+            assert temporary_index.process_may_be_active is False
+            lock_preexisting_states.append(lock_path.exists())
+            if not lock_preexisting_states[-1]:
+                lock_path.write_bytes(b"fixture-owned lock")
+            assert lock_path.exists()
+            prepared_lock_paths.append(lock_path)
+        return original_remove_owned_artifacts(temporary_index)
+
+    monkeypatch.setattr(
+        git_module, "_remove_owned_artifacts", ensure_owned_lock_at_cleanup
+    )
 
     def fail_owned_lock(path, *args, **kwargs):
-        if temporary_indexes and path == Path(str(temporary_indexes[-1]) + ".lock"):
+        if prepared_lock_paths and path == prepared_lock_paths[0]:
+            # Assert the artifact exists at the exact point of injected failure.
+            assert path.exists()
             raise lock_error
         return original_unlink(path, *args, **kwargs)
 
@@ -1159,18 +1186,67 @@ def test_failed_owned_index_lock_deletion_is_reported(
         with pytest.raises(git_module.GitCollectionError) as caught:
             _capture_snapshot_with_outer_deadline(repo, release)
         assert _reason(caught.value) == "deadline-exceeded"
+        process_result = caught.value.process_result
+        assert process_result.cleanup_attempted is True
+        assert process_result.cleanup_errors == []
+        assert process_result.surviving_pids == []
+        assert process_result.exit_code is not None
         cleanup = caught.value.git_cleanup_failure
         assert cleanup.reason == "cleanup-failed"
         assert cleanup.cleanup_error_count == 1
+        assert len(prepared_lock_paths) == 1
+        assert len(lock_preexisting_states) == 1
+        assert prepared_lock_paths[0] == Path(str(temporary_indexes[0]) + ".lock")
         assert cleanup.temporary_artifact_unresolved_count == 1
+        assert cleanup.temporary_artifact_cleanup_uncertain is True
         assert not temporary_indexes[0].exists()
-        assert Path(str(temporary_indexes[0]) + ".lock").exists()
+        assert prepared_lock_paths[0].exists()
         assert real_index.read_bytes() == real_index_bytes
     finally:
         release.touch()
         monkeypatch.setattr(Path, "unlink", original_unlink)
-        if temporary_indexes:
-            original_unlink(Path(str(temporary_indexes[0]) + ".lock"), missing_ok=True)
+        for lock_path in prepared_lock_paths:
+            original_unlink(lock_path, missing_ok=True)
+
+
+def test_failed_unlink_for_absent_owned_lock_does_not_report_unresolved(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import time
+
+    index_path = tmp_path / "absent-index"
+    lock_path = Path(str(index_path) + ".lock")
+    owner = git_module._TemporaryIndex(
+        path=index_path,
+        lock_path=lock_path,
+        artifact_state="owned",
+    )
+    lock_error = OSError("injected unlink error for absent lock")
+    original_unlink = Path.unlink
+
+    def fail_absent_lock(path, *args, **kwargs):
+        if path == lock_path:
+            assert not path.exists()
+            raise lock_error
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_absent_lock)
+    with pytest.raises(OSError) as caught:
+        git_module._cleanup_temporary_index(
+            owner,
+            deadline=time.monotonic() + 5.0,
+            stage="snapshot-cleanup",
+        )
+
+    assert caught.value is lock_error
+    failure = caught.value.git_failure
+    assert failure.reason == "cleanup-failed"
+    assert failure.cleanup_error_count == 1
+    assert failure.temporary_artifact_unresolved_count == 0
+    assert failure.temporary_artifact_cleanup_uncertain is False
+    assert not index_path.exists()
+    assert not lock_path.exists()
 
 
 def test_unconfirmed_git_process_preserves_owned_index_and_lock(
