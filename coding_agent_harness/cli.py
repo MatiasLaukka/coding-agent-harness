@@ -16,6 +16,7 @@ from .models import (
     TaskPacket,
     VerificationCommand,
 )
+from . import report
 from .orchestrator import TaskRunResult, run_task
 from .worker import QwenWorker, WorkerRunResult
 from .git import (
@@ -384,6 +385,11 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    run_parser.add_argument(
+        "--report", type=Path, metavar="PATH",
+        help="Save a completed Markdown report outside the target repository; never overwrite.",
+    )
+
     handoff_parser = subparsers.add_parser(
         "handoff", help="Validate supervisor documents; never execute proposals.")
     handoff_commands = handoff_parser.add_subparsers(dest="handoff_command", required=True)
@@ -444,6 +450,14 @@ def app(
         _print_failure_evidence(exc, stage="task-file", worker_invocation_count=0)
         return 1
 
+    report_path = None
+    if args.report is not None:
+        try:
+            report_path = report.validate_report_destination(args.report, repo_dir=repo_dir)
+        except (OSError, ValueError, RuntimeError):
+            print("Report destination error: details omitted.", file=sys.stderr)
+            return 1
+
     worker_invocation_count = 0
     try:
         worker = QwenWorker(
@@ -483,6 +497,18 @@ def app(
     _print_result(
         result
     )
+
+    if report_path is not None:
+        try:
+            content = report.render_run_report(
+                task=spec.task, verification_commands=spec.verification_commands,
+                result=result,
+            )
+            report.publish_run_report(report_path, content, repo_dir=repo_dir)
+        except (Exception, KeyboardInterrupt):
+            print("Report publication failed: captured run outcome unchanged; details omitted.",
+                  file=sys.stderr)
+            return 1
 
     if result.status == "ready-for-review":
         return 0

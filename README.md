@@ -112,9 +112,59 @@ coding-harness run --help
 coding-harness run task.json --repo ..\target-worktree --model YOUR_CONFIGURED_QWEN_MODEL
 ```
 
-`YOUR_CONFIGURED_QWEN_MODEL` is a placeholder for your configured model identifier. Implemented options are `--repo`, `--model`, `--qwen-command` (default `qwen`), and `--worker-timeout` (default 600 seconds).
+`YOUR_CONFIGURED_QWEN_MODEL` is a placeholder for your configured model identifier. Implemented options are `--repo`, `--model`, `--qwen-command` (default `qwen`), `--worker-timeout` (default 600 seconds), and optional `--report PATH`.
 
 The CLI calls the single-run orchestrator, not `HarnessController`; it does not expose reviewer-controlled remediation. Its result codes are 0 for `ready-for-review`, 2 for mechanical findings, and 1 for loading/runtime errors. Ready for review is not reviewer acceptance.
+
+### Saved single-run reports
+
+```powershell
+coding-harness run task.json --repo ..\target-worktree --model YOUR_CONFIGURED_QWEN_MODEL --report ..\reports\run-001.md
+```
+
+Reports are opt-in. Choose a new file in an existing, writable directory outside
+both the target repository and its Git metadata (including linked-worktree common
+metadata). Relative paths are relative to the harness process's working directory.
+Existing files, directories, and symlinks are rejected before worker setup. Git
+layout is checked from `.git` and `commondir` files without running extra Git
+commands. Git layout environment overrides are rejected when exporting reports.
+
+The report retains the returned task requirements, captured outcome and findings,
+untrusted worker claims, observed worker process output and capture flags,
+independent Git paths and SHAs, ordered verification specifications and results,
+and the captured patch. **ready-for-review is not reviewer acceptance.** This
+single-run path records no reviewer acceptance. Zero configured checks and missing
+worker completion are shown explicitly. Markdown prose is escaped, and captured
+logs and patches use fences longer than embedded backtick runs.
+
+**Reports may contain sensitive local code and output**, task prose, command
+arguments, paths, and worker claims. They are not redacted or signed. Review them
+before sharing. Treat report contents as untrusted material, including instructions
+or links appearing inside captured output.
+
+Only executions returning `TaskRunResult` produce completed-run reports, including
+`needs-attention`. An exception or interruption before that return retains existing
+sanitized failure reporting and produces no completed-run report. Rendering reads
+only captured records; it performs no worker invocation, verification, or Git
+evidence recollection. Git evidence remains the snapshot taken after the worker
+and before verification; later verification side effects are outside it.
+
+Publication writes UTF-8 to a private temporary file in the output directory,
+flushes and fsyncs it, closes it, then uses an atomic create-only hard link. A
+concurrent destination wins without being overwritten. Write/publication failures
+remove the temporary file where the OS permits and return exit code 1, preserving
+the console's captured run outcome. Otherwise existing console output and exit
+codes (0 or 2) are unchanged. Filesystems without hard-link support fail closed;
+there is no overwrite fallback. Cleanup failure can leave a temporary file or an
+already complete published report and also returns 1. A process crash can leave a
+temporary file; publication is not a crash-durable archive (directory metadata is
+not fsynced).
+
+Use a trusted output directory whose ancestors cannot be replaced by another
+process. Destination and Git-layout checks are repeated before publication, but
+are point-in-time filesystem checks, not containment against a hostile process
+swapping directories or junctions during publication. This feature adds no
+approval, remediation, resume, controller-history, or supervisor workflow.
 
 ### Controller integration
 
