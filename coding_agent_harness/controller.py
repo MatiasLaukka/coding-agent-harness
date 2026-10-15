@@ -6,6 +6,7 @@ from typing import Literal, Sequence
 from pydantic import Field
 
 from coding_agent_harness.git import (
+    GitFailureMetadata,
     capture_attempt_evidence,
     capture_baseline,
     capture_evidence,
@@ -135,6 +136,10 @@ class HarnessController:
                     record["failed_process"] = exc.process_result
             if hasattr(exc, "git_evidence"):
                 context["partial_git_evidence"] = exc.git_evidence
+            if isinstance(getattr(exc, "git_failure", None), GitFailureMetadata):
+                context["git_failure"] = exc.git_failure
+            if isinstance(getattr(exc, "git_cleanup_failure", None), GitFailureMetadata):
+                context["git_cleanup_failure"] = exc.git_cleanup_failure
             exc.harness_evidence = context
             raise
 
