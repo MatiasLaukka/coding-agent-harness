@@ -451,9 +451,12 @@ def app(
         return 1
 
     report_path = None
+    report_roots = None
     if args.report is not None:
         try:
-            report_path = report.validate_report_destination(args.report, repo_dir=repo_dir)
+            report_roots = report.discover_report_roots(repo_dir)
+            report_path = report.validate_report_destination(
+                args.report, repo_dir=repo_dir, protected_roots=report_roots)
         except (OSError, ValueError, RuntimeError):
             print("Report destination error: details omitted.", file=sys.stderr)
             return 1
@@ -504,7 +507,8 @@ def app(
                 task=spec.task, verification_commands=spec.verification_commands,
                 result=result,
             )
-            report.publish_run_report(report_path, content, repo_dir=repo_dir)
+            report.publish_run_report(
+                report_path, content, repo_dir=repo_dir, protected_roots=report_roots)
         except (Exception, KeyboardInterrupt):
             print("Report publication failed: captured run outcome unchanged; details omitted.",
                   file=sys.stderr)

@@ -126,8 +126,17 @@ Reports are opt-in. Choose a new file in an existing, writable directory outside
 both the target repository and its Git metadata (including linked-worktree common
 metadata). Relative paths are relative to the harness process's working directory.
 Existing files, directories, and symlinks are rejected before worker setup. Git
-layout is checked from `.git` and `commondir` files without running extra Git
-commands. Git layout environment overrides are rejected when exporting reports.
+layout is established before dispatch by one fixed, read-only `git rev-parse`
+query, using the existing bounded process runner (10-second phase budget, 16 KiB
+stdout and 4 KiB stderr limits). Optional Git locks and fsmonitor are disabled;
+no worker, hook, verification, status, diff, or evidence collection is requested.
+The supplied target, actual worktree, Git admin/common directories, and bound
+`.git` discovery location are all protected, including `core.worktree` redirects.
+An ignored nested `.git` directory cannot narrow those exclusions. Standard `.git`
+files and linked worktrees are supported. Bare repositories, unavailable Git,
+failed/incomplete discovery, ambiguous multiline paths, and unrecognized or over
+4 KiB Git layout files fail closed. Git layout environment overrides remain
+unsupported.
 
 The report retains the returned task requirements, captured outcome and findings,
 untrusted worker claims, observed worker process output and capture flags,
@@ -161,8 +170,9 @@ temporary file; publication is not a crash-durable archive (directory metadata i
 not fsynced).
 
 Use a trusted output directory whose ancestors cannot be replaced by another
-process. Destination and Git-layout checks are repeated before publication, but
-are point-in-time filesystem checks, not containment against a hostile process
+process. The CLI freezes discovered roots before dispatch; publication rechecks
+filesystem paths against those roots without any post-dispatch Git query or fresh
+run evidence. These are point-in-time checks, not containment against a hostile process
 swapping directories or junctions during publication. This feature adds no
 approval, remediation, resume, controller-history, or supervisor workflow.
 

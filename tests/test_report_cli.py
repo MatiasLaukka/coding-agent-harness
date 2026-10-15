@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from coding_agent_harness import cli, orchestrator
+from coding_agent_harness import cli, orchestrator, report
 from coding_agent_harness.worker import QwenWorker
 from tests.test_report import layout, sample, task
 
@@ -53,7 +53,7 @@ def test_cli_invalid_report_prevents_worker_setup(tmp_path, monkeypatch, capsys,
     if kind == 'exists': destination.write_text('keep')
     if kind == 'missing-parent': destination = tmp_path / 'absent' / 'report.md'
     if kind == 'permission': monkeypatch.setattr(report.os, 'access', lambda *a: False)
-    if kind == 'git-layout': (repo / '.git').rmdir()
+    if kind == 'git-layout': (repo / '.git').rename(repo / 'saved-metadata')
     def forbidden(**kwargs): pytest.fail('worker invoked for invalid destination')
     monkeypatch.setattr(cli, 'QwenWorker', forbidden)
     monkeypatch.setattr(cli, 'run_task', forbidden)
@@ -122,17 +122,22 @@ def test_real_offline_run_report_does_not_recollect_or_redispatch(tmp_path, monk
     def track(owner, name):
         original = getattr(owner, name)
         def call(*a, **kw):
+            if owner is report:
+                assert 'run' not in counts, 'Git layout discovery occurred after worker dispatch'
             counts[name] = counts.get(name, 0) + 1
             return original(*a, **kw)
         monkeypatch.setattr(owner, name, call)
     for name in ('capture_baseline', 'capture_evidence', 'run_verification'):
         track(orchestrator, name)
     track(QwenWorker, 'run')
+    track(report, 'run_process')
     spec = tmp_path / 'task.json'
     spec.write_text(json.dumps({'task': task().model_dump(), 'verification_commands': [{'id': 'content', 'argv': [sys.executable, '-c', "from pathlib import Path; assert Path('observed.py').read_text() == 'after\\n'"]}]}))
     destination = tmp_path / 'report.md'
     assert cli.app(args(repo, spec, destination if with_report else None)) == (0 if complete else 2)
-    assert counts == {'capture_baseline': 1, 'capture_evidence': 1, 'run_verification': 1, 'run': 1}
+    expected_counts = {'capture_baseline': 1, 'capture_evidence': 1, 'run_verification': 1, 'run': 1}
+    if with_report: expected_counts['run_process'] = 1
+    assert counts == expected_counts
     assert capsys.readouterr().err == ''
     assert destination.exists() == with_report
     if with_report:
@@ -150,7 +155,7 @@ def test_cli_report_rechecks_layout_after_worker(tmp_path, monkeypatch, capsys):
     calls = []
     def run(**kw):
         calls.append(1)
-        (repo / '.git').rmdir()
+        (repo / '.git').rename(repo / 'saved-metadata')
         return sample()
     monkeypatch.setattr(cli, 'run_task', run)
     assert cli.app(args(repo, task_file, destination)) == 1

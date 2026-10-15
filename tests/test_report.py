@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -32,7 +33,7 @@ def task():
 def layout(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
-    (repo / ".git").mkdir()
+    subprocess.run(['git', 'init', '-q', str(repo)], check=True, capture_output=True, timeout=10)
     return repo
 
 
@@ -119,15 +120,13 @@ def test_reject_invalid_destinations(tmp_path, kind):
 
 def test_linked_worktree_and_subdirectory_metadata(tmp_path):
     from coding_agent_harness.report import validate_report_destination
+    from tests.test_report_layout import committed_repo, git
+    main = committed_repo(tmp_path)
     repo = tmp_path / 'linked'
-    repo.mkdir()
-    common = tmp_path / 'metadata'
-    admin = common / 'worktrees' / 'linked'
-    admin.mkdir(parents=True)
-    (repo / '.git').write_text(f'gitdir: {admin}\n')
-    (admin / 'commondir').write_text('../..\n')
+    git(main, 'worktree', 'add', '--quiet', '--detach', str(repo), 'HEAD')
+    admin = Path(git(repo, 'rev-parse', '--absolute-git-dir')).resolve()
+    common = Path(git(repo, 'rev-parse', '--path-format=absolute', '--git-common-dir')).resolve()
     subdir = repo / 'src'
-    subdir.mkdir()
     for path in [repo / 'bad.md', common / 'bad.md', admin / 'bad.md']:
         with pytest.raises(ValueError): validate_report_destination(path, repo_dir=subdir)
     assert validate_report_destination(tmp_path / 'ok.md', repo_dir=subdir) == tmp_path / 'ok.md'
@@ -213,7 +212,7 @@ def test_unknown_git_layout_fails_closed(tmp_path, monkeypatch, kind):
     repo = layout(tmp_path)
     marker = repo / '.git'
     if kind in ('malformed', 'oversized', 'missing-admin'):
-        marker.rmdir()
+        marker.rename(repo / 'saved-metadata')
         marker.write_text('invalid' if kind == 'malformed' else 'x' * 4097 if kind == 'oversized' else 'gitdir: absent')
     if kind == 'empty-common': (marker / 'commondir').write_text('')
     if kind == 'override': monkeypatch.setenv('GIT_DIR', str(tmp_path / 'elsewhere'))

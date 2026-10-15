@@ -6,12 +6,13 @@ import json
 import os
 import re
 import tempfile
+import time
 from pathlib import Path
 from typing import Sequence
 
 from .models import TaskPacket, VerificationCommand
 from .orchestrator import TaskRunResult
-from .process import ProcessResult
+from .process import ProcessResult, run_process
 
 
 def _text(value: str) -> str:
@@ -93,50 +94,63 @@ def render_run_report(*, task: TaskPacket,
     return '\n'.join(sections)
 
 
-def _read_layout_file(path: Path) -> str:
-    with path.open('rb') as stream:
-        data = stream.read(4097)
-    if len(data) > 4096:
-        raise ValueError('Git layout file too large')
-    return data.decode('utf-8').strip()
-
-
-def _protected_roots(repo_dir: Path) -> list[Path]:
-    # Inspect only layout files, never run Git or collect additional evidence.
-    # Environment overrides can relocate metadata beyond the discovered layout.
+def discover_report_roots(repo_dir: Path) -> tuple[Path, ...]:
+    """Bounded, read-only pre-dispatch layout discovery; never collect run evidence."""
     for key in ('GIT_DIR', 'GIT_COMMON_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE',
                 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES'):
         if os.environ.get(key):
             raise ValueError('Git layout environment overrides unsupported for reports')
-    repo = repo_dir.resolve(strict=True)
-    if not repo.is_dir():
+    supplied = repo_dir.resolve(strict=True)
+    if not supplied.is_dir():
         raise ValueError('Repository directory required')
-    for root in (repo, *repo.parents):
-        marker = root / '.git'
-        if os.path.lexists(marker):
-            if marker.is_dir():
-                admin = marker.resolve(strict=True)
-            else:
-                content = _read_layout_file(marker)
-                if not content.startswith('gitdir: ') or not content[8:]:
-                    raise ValueError('Invalid Git layout')
-                admin = (root / content[8:]).resolve(strict=True)
-            if not admin.is_dir():
-                raise ValueError('Invalid Git directory')
-            common_file = admin / 'commondir'
-            common = admin
-            if os.path.lexists(common_file):
-                value = _read_layout_file(common_file)
-                if not value:
-                    raise ValueError('Invalid common directory')
-                common = (admin / value).resolve(strict=True)
-                if not common.is_dir():
-                    raise ValueError('Invalid common directory')
-            return [root, admin, common]
-    raise ValueError('Cannot determine repository layout')
+    env = dict(os.environ)
+    env['GIT_OPTIONAL_LOCKS'] = '0'
+    process = run_process(
+        argv=['git', '--no-optional-locks', '-c', 'core.fsmonitor=false',
+              'rev-parse', '--path-format=absolute', '--show-toplevel',
+              '--absolute-git-dir', '--git-common-dir'],
+        cwd=supplied, env=env, timeout_seconds=10,
+        deadline=time.monotonic() + 10,
+        stdout_limit_bytes=16 * 1024, stderr_limit_bytes=4 * 1024,
+    )
+    if process.infrastructure_failed or process.exit_code != 0:
+        raise ValueError('Git layout discovery failed')
+    lines = process.stdout.splitlines()
+    if len(lines) != 3 or any(not line or not Path(line).is_absolute() for line in lines):
+        raise ValueError('Unsupported Git layout response')
+    actual, admin, common = (Path(line).resolve(strict=True) for line in lines)
+    roots = [supplied, actual, admin, common]
+    # Bind the discovery location to the Git-resolved admin directory. An
+    # ignored nested marker cannot establish a boundary, and an enclosing,
+    # unrelated repository must not accidentally become the target either.
+    # Keep every matching ancestor, including aliases to the same metadata.
+    bound = False
+    for parent in (supplied, *supplied.parents):
+        marker = parent / '.git'
+        if marker.is_dir():
+            matches = marker.resolve(strict=True) == admin
+        elif marker.is_file():
+            with marker.open('rb') as stream:
+                raw = stream.read(4097)
+            if len(raw) > 4096:
+                raise ValueError('Unsupported Git layout file')
+            value = raw.decode('utf-8').strip()
+            matches = (value.startswith('gitdir: ') and bool(value[8:])
+                       and (parent / value[8:]).resolve(strict=True) == admin)
+        else:
+            matches = False
+        if matches:
+            roots.append(parent)
+            bound = True
+    if not bound:
+        raise ValueError('Cannot bind Git discovery location')
+    if any(not root.is_dir() for root in roots):
+        raise ValueError('Invalid Git layout directories')
+    return tuple(dict.fromkeys(roots))
 
 
-def validate_report_destination(destination: Path, *, repo_dir: Path) -> Path:
+def validate_report_destination(destination: Path, *, repo_dir: Path,
+                                protected_roots: tuple[Path, ...] | None = None) -> Path:
     """Point-in-time validation; output parents must be trusted and pre-existing."""
     destination = Path(destination).absolute()
     name = destination.name
@@ -151,20 +165,27 @@ def validate_report_destination(destination: Path, *, repo_dir: Path) -> Path:
     resolved = parent / name
     if '.git' in (part.casefold() for part in resolved.parts):
         raise ValueError('Report destination is in Git metadata')
-    if any(resolved.is_relative_to(root) for root in _protected_roots(repo_dir)):
+    roots = discover_report_roots(repo_dir) if protected_roots is None else protected_roots
+    if repo_dir.resolve(strict=True) not in roots:
+        raise ValueError('Report roots do not cover supplied target')
+    if any(root.resolve(strict=True) != root or not root.is_dir() for root in roots):
+        raise ValueError('Protected report root changed')
+    if any(resolved.is_relative_to(root) for root in roots):
         raise ValueError('Report destination is inside the repository or Git metadata')
     if not os.access(parent, os.W_OK):
         raise PermissionError('Report parent is not writable')
     return resolved
 
 
-def publish_run_report(destination: Path, content: str, *, repo_dir: Path) -> None:
+def publish_run_report(destination: Path, content: str, *, repo_dir: Path,
+                       protected_roots: tuple[Path, ...] | None = None) -> None:
     """Publish complete UTF-8 bytes with atomic no-replace linking, or fail closed.
 
     No rename/replace fallback: filesystems without hard links are unsupported.
     A cleanup failure is surfaced even if complete bytes were already published.
     """
-    destination = validate_report_destination(destination, repo_dir=repo_dir)
+    roots = discover_report_roots(repo_dir) if protected_roots is None else protected_roots
+    destination = validate_report_destination(destination, repo_dir=repo_dir, protected_roots=roots)
     data = content.encode('utf-8')
     descriptor, temporary = tempfile.mkstemp(prefix='.harness-report-', dir=destination.parent)
     try:
@@ -175,8 +196,8 @@ def publish_run_report(destination: Path, content: str, *, repo_dir: Path) -> No
                 raise OSError('Incomplete report write')
             stream.flush()
             os.fsync(stream.fileno())
-        # Recheck layout/parent after writing; os.link handles destination races.
-        checked = validate_report_destination(destination, repo_dir=repo_dir)
+        # Recheck paths against frozen preflight roots; never rediscover Git here.
+        checked = validate_report_destination(destination, repo_dir=repo_dir, protected_roots=roots)
         if checked != destination:
             raise ValueError('Report parent changed')
         os.link(temporary, destination)
