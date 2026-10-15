@@ -7,7 +7,7 @@ import tempfile
 import threading
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Iterator
 
@@ -173,12 +173,34 @@ def _attach_failure(
     *,
     attribute: str = "git_failure",
 ) -> None:
-    if not hasattr(exc, attribute):
-        setattr(exc, attribute, failure)
+    previous = getattr(exc, attribute, None)
+    if isinstance(previous, GitFailureMetadata):
+        # Counts are cumulative observations of this collection, not deltas.
+        # Max/OR is idempotent and cannot erase an earlier unresolved resource.
+        failure = replace(
+            previous,
+            exit_code=previous.exit_code if previous.exit_code is not None else failure.exit_code,
+            stdout_truncated=previous.stdout_truncated or failure.stdout_truncated,
+            stderr_truncated=previous.stderr_truncated or failure.stderr_truncated,
+            cleanup_error_count=max(previous.cleanup_error_count, failure.cleanup_error_count),
+            surviving_process_count=max(previous.surviving_process_count, failure.surviving_process_count),
+            filesystem_operation_pending_count=max(
+                previous.filesystem_operation_pending_count, failure.filesystem_operation_pending_count,
+            ),
+            temporary_artifact_unresolved_count=max(
+                previous.temporary_artifact_unresolved_count, failure.temporary_artifact_unresolved_count,
+            ),
+            temporary_artifact_cleanup_uncertain=(
+                previous.temporary_artifact_cleanup_uncertain
+                or failure.temporary_artifact_cleanup_uncertain
+            ),
+        )
+    setattr(exc, attribute, failure)
 
 
 def _attach_observations(exc: BaseException, observations: dict) -> None:
-    exc.git_evidence = observations
+    previous = getattr(exc, "git_evidence", {})
+    exc.git_evidence = {**observations, **previous}
 
 
 def _raise_git_failure(
@@ -259,6 +281,31 @@ def _filesystem_failure(
     )
 
 
+@dataclass
+class _FilesystemOperation:
+    """One serial helper's ownership, installed before construction/startup.
+
+    accepted means all filesystem work completed and belongs to the caller;
+    abandoned means only the helper may clean up, until its callback settles.
+    No OS wait is needed to inspect this ticket on the caller's failure path.
+    """
+
+    lifecycle: str = "not-started"
+    abandoned: bool = False
+    pending_artifacts: int = 0
+    state_lock: object = field(default_factory=threading.Lock)
+    completed: threading.Event = field(default_factory=threading.Event)
+    decision: threading.Event = field(default_factory=threading.Event)
+    value: object = None
+    error: BaseException | None = None
+    traceback: object = None
+    completed_at: float | None = None
+
+    @property
+    def unsettled(self) -> bool:
+        return self.lifecycle not in {"not-started", "accepted", "settled"}
+
+
 def _bounded_filesystem_call(
     operation,
     *,
@@ -268,6 +315,7 @@ def _bounded_filesystem_call(
     cleanup: bool = False,
     on_starting=None,
     on_late_completion=None,
+    owner: _TemporaryIndex | None = None,
 ):
     """Run one blocking filesystem phase without extending its absolute deadline.
 
@@ -280,17 +328,17 @@ def _bounded_filesystem_call(
     if wait_deadline <= time.monotonic():
         _raise_git_failure("deadline-exceeded", stage)
 
-    state_lock = threading.Lock()
-    completed = threading.Event()
-    decision = threading.Event()
-    state = {
-        "value": None,
-        "error": None,
-        "traceback": None,
-        "completed_at": None,
-        "abandoned": False,
-        "lifecycle": "not-started",
-    }
+    operation_owner = _FilesystemOperation(pending_artifacts=pending_artifacts)
+    if owner is not None:
+        if owner.filesystem_operation is not None and owner.filesystem_operation.unsettled:
+            raise _filesystem_failure(
+                "incomplete-collection", stage, pending=1,
+                unresolved=pending_artifacts, cleanup_uncertain=True,
+            )
+        owner.filesystem_operation = operation_owner
+    state_lock = operation_owner.state_lock
+    completed = operation_owner.completed
+    decision = operation_owner.decision
 
     def run_operation() -> None:
         try:
@@ -302,15 +350,16 @@ def _bounded_filesystem_call(
             error = exc
             error_traceback = exc.__traceback__
         with state_lock:
-            state["value"] = value
-            state["error"] = error
-            state["traceback"] = error_traceback
-            state["completed_at"] = time.monotonic()
-            state["lifecycle"] = "completed"
+            operation_owner.value = value
+            operation_owner.error = error
+            operation_owner.traceback = error_traceback
+            operation_owner.completed_at = time.monotonic()
+            if not operation_owner.abandoned:
+                operation_owner.lifecycle = "completed"
         completed.set()
         decision.wait()
         with state_lock:
-            abandoned = state["abandoned"]
+            abandoned = operation_owner.abandoned
         if abandoned and on_late_completion is not None:
             try:
                 on_late_completion(value, error)
@@ -320,35 +369,35 @@ def _bounded_filesystem_call(
                 pass
             finally:
                 with state_lock:
-                    state["lifecycle"] = "late-cleanup-completed"
+                    operation_owner.lifecycle = "settled"
 
-    helper = threading.Thread(
-        target=run_operation,
-        daemon=True,
-        name="harness-git-filesystem",
-    )
     try:
+        helper = threading.Thread(
+            target=run_operation,
+            daemon=True,
+            name="harness-git-filesystem",
+        )
         # Record possible helper ownership before startup: Thread.start() can
         # raise in the caller after the new thread has become live.
         with state_lock:
-            state["lifecycle"] = "may-be-running"
+            operation_owner.lifecycle = "may-be-running"
         if on_starting is not None:
             on_starting()
         helper.start()
         completed.wait(max(0.0, wait_deadline - time.monotonic()))
         with state_lock:
-            completed_at = state["completed_at"]
-            value = state["value"]
-            error = state["error"]
-            error_traceback = state["traceback"]
+            completed_at = operation_owner.completed_at
+            value = operation_owner.value
+            error = operation_owner.error
+            error_traceback = operation_owner.traceback
             pending = completed_at is None
         late = not pending and (
             completed_at >= wait_deadline or time.monotonic() >= deadline
         )
         if pending or late:
             with state_lock:
-                state["abandoned"] = True
-                state["lifecycle"] = "abandoned"
+                operation_owner.abandoned = True
+                operation_owner.lifecycle = "abandoned"
             failure = _filesystem_failure(
                 "deadline-exceeded",
                 stage,
@@ -360,13 +409,15 @@ def _bounded_filesystem_call(
             decision.set()
             raise failure
         if error is not None:
+            with state_lock:
+                operation_owner.lifecycle = "accepted"
             decision.set()
             raise error.with_traceback(error_traceback)
         # Recheck after completion was observed, while the helper still waits
         # for its decision and can safely perform late cleanup.
         _remaining(deadline, stage)
         with state_lock:
-            state["lifecycle"] = "accepted"
+            operation_owner.lifecycle = "accepted"
         decision.set()
         return value
     except BaseException as exc:
@@ -376,8 +427,10 @@ def _bounded_filesystem_call(
         if decision.is_set():
             raise
         with state_lock:
-            state["abandoned"] = True
-            state["lifecycle"] = "abandoned"
+            possible_start = operation_owner.lifecycle != "not-started"
+            operation_owner.abandoned = possible_start
+            if possible_start:
+                operation_owner.lifecycle = "abandoned"
         decision.set()
         existing_failure = getattr(exc, "git_failure", None)
         reason = (
@@ -391,12 +444,12 @@ def _bounded_filesystem_call(
             _failure_metadata(
                 reason,
                 stage,
-                filesystem_operation_pending_count=1,
-                temporary_artifact_unresolved_count=pending_artifacts,
-                temporary_artifact_cleanup_uncertain=bool(pending_artifacts),
+                filesystem_operation_pending_count=int(possible_start),
+                temporary_artifact_unresolved_count=pending_artifacts if possible_start else 0,
+                temporary_artifact_cleanup_uncertain=bool(pending_artifacts and possible_start),
             ),
         )
-        exc.git_filesystem_operation_pending = True
+        exc.git_filesystem_operation_pending = possible_start
         raise
 
 
@@ -515,10 +568,14 @@ def _attach_unexpected_failure(
     exc: BaseException,
     observations: dict,
     stage: str,
+    ownership: _GitCollectionOwnership | None = None,
 ) -> None:
     _attach_observations(exc, observations)
-    if not hasattr(exc, "git_failure"):
-        _attach_failure(exc, _failure_metadata("incomplete-collection", stage))
+    _attach_failure(
+        exc,
+        ownership.failure(stage) if ownership is not None
+        else _failure_metadata("incomplete-collection", stage),
+    )
 
 
 def capture_baseline(repo: Path) -> GitBaseline:
@@ -555,15 +612,58 @@ class _TemporaryIndex:
     lock_path: Path | None = None
     descriptor: int | None = None
     descriptor_uncertain: bool = False
+    descriptor_close_started: bool = False
+    filesystem_operation: _FilesystemOperation | None = None
+    # Positive cleanup observations supersede estimates of the owned pair.
+    cleanup_unresolved_count: int | None = None
     creation_result: tuple[int, str] | None = None
     artifact_state: str = "not-created"
-    operation_state: str = "not-started"
-    cleanup_state: str = "not-started"
     process_may_be_active: bool = False
     process_result: ProcessResult | None = None
 
 
+@dataclass
+class _GitCollectionOwnership:
+    """The collection retains owners across context-manager/cleanup handoffs."""
+
+    indexes: list[_TemporaryIndex] = field(default_factory=list)
+
+    def register(self, owner: _TemporaryIndex) -> None:
+        if not any(index is owner for index in self.indexes):
+            self.indexes.append(owner)
+
+    def failure(self, stage: str) -> GitFailureMetadata:
+        pending = unresolved = 0
+        uncertain = False
+        for owner in self.indexes:
+            operation = owner.filesystem_operation
+            if operation is not None and operation.unsettled:
+                pending += 1
+                unresolved += operation.pending_artifacts
+                uncertain = True
+            else:
+                count = _owned_artifact_count(owner)
+                if owner.process_may_be_active:
+                    count = max(2, count)
+                unresolved += count
+                uncertain |= bool(count or owner.process_may_be_active)
+            uncertain |= owner.artifact_state not in {"not-created", "cleanup-confirmed"}
+        return _failure_metadata(
+            "incomplete-collection", stage,
+            filesystem_operation_pending_count=pending,
+            temporary_artifact_unresolved_count=unresolved,
+            temporary_artifact_cleanup_uncertain=uncertain,
+        )
+
+    def require_complete(self, stage: str) -> None:
+        failure = self.failure(stage)
+        if failure.temporary_artifact_cleanup_uncertain:
+            raise GitCollectionError(failure)
+
+
 def _owned_artifact_count(temporary_index: _TemporaryIndex) -> int:
+    if temporary_index.cleanup_unresolved_count is not None:
+        return temporary_index.cleanup_unresolved_count
     path_count = (
         0
         if temporary_index.artifact_state in {"not-created", "cleanup-confirmed"}
@@ -571,24 +671,27 @@ def _owned_artifact_count(temporary_index: _TemporaryIndex) -> int:
     )
     descriptor_count = int(
         temporary_index.descriptor is not None or temporary_index.descriptor_uncertain
+        or (temporary_index.creation_result is not None and not temporary_index.descriptor_close_started)
     )
     return path_count + descriptor_count
 
 
 def _close_temporary_index_descriptor(temporary_index: _TemporaryIndex) -> None:
+    if temporary_index.descriptor_close_started:
+        return
     descriptor = temporary_index.descriptor
     if descriptor is None:
+        if temporary_index.creation_result is not None:
+            descriptor = temporary_index.creation_result[0]
+    if descriptor is None:
         return
-    try:
-        os.close(descriptor)
-    except BaseException:
-        # A failed close may still have consumed the handle. Do not retry its
-        # numeric value, which the OS could already have reused.
-        temporary_index.descriptor = None
-        temporary_index.descriptor_uncertain = True
-        raise
-    else:
-        temporary_index.descriptor = None
+    # Publish uncertainty BEFORE close may consume/recycle the numeric handle.
+    # Even an interruption during close's result publication must never retry it.
+    temporary_index.descriptor_uncertain = True
+    temporary_index.descriptor_close_started = True
+    temporary_index.descriptor = None
+    os.close(descriptor)
+    temporary_index.descriptor_uncertain = False
 
 
 def _remove_owned_artifacts(
@@ -597,16 +700,11 @@ def _remove_owned_artifacts(
     """Best-effort removal of only this collector's index and its exact lock."""
     errors = 0
     first_error: BaseException | None = None
-    if temporary_index.descriptor is not None:
-        try:
-            os.close(temporary_index.descriptor)
-        except BaseException as exc:
-            errors += 1
-            first_error = first_error or exc
-            temporary_index.descriptor = None
-            temporary_index.descriptor_uncertain = True
-        else:
-            temporary_index.descriptor = None
+    try:
+        _close_temporary_index_descriptor(temporary_index)
+    except BaseException as exc:
+        errors += 1
+        first_error = exc
 
     path = temporary_index.path
     lock_path = temporary_index.lock_path
@@ -649,9 +747,22 @@ def _cleanup_temporary_index(
     deadline: float,
     stage: str,
 ) -> GitFailureMetadata | None:
+    operation_owner = temporary_index.filesystem_operation
+    if operation_owner is not None and operation_owner.unsettled:
+        return _failure_metadata(
+            "incomplete-collection", stage,
+            filesystem_operation_pending_count=1,
+            temporary_artifact_unresolved_count=operation_owner.pending_artifacts,
+            temporary_artifact_cleanup_uncertain=True,
+        )
+    if (
+        temporary_index.artifact_state in {"not-created", "cleanup-confirmed"}
+        and _owned_artifact_count(temporary_index) == 0
+        and (temporary_index.artifact_state == "cleanup-confirmed" or temporary_index.path is None)
+    ):
+        return None
     if temporary_index.process_may_be_active:
         temporary_index.artifact_state = "cleanup-uncertain"
-        temporary_index.cleanup_state = "cleanup-uncertain"
         return _failure_metadata(
             "termination-unconfirmed",
             stage,
@@ -664,7 +775,6 @@ def _cleanup_temporary_index(
     # accounting without probing the filesystem after the deadline.
     if time.monotonic() >= deadline:
         temporary_index.artifact_state = "cleanup-uncertain"
-        temporary_index.cleanup_state = "cleanup-uncertain"
         raise GitCollectionError(
             _failure_metadata(
                 "deadline-exceeded",
@@ -683,7 +793,7 @@ def _cleanup_temporary_index(
             stage=stage,
             pending_artifacts=_owned_artifact_count(temporary_index) or 2,
             cleanup=True,
-            on_starting=lambda: setattr(temporary_index, "cleanup_state", "may-be-running"),
+            owner=temporary_index,
             on_late_completion=lambda value, error: _late_cleanup_owned_index(
                 temporary_index, value, error
             ),
@@ -692,7 +802,6 @@ def _cleanup_temporary_index(
         failure = getattr(exc, "git_failure", None)
         if isinstance(failure, GitFailureMetadata):
             temporary_index.artifact_state = "cleanup-uncertain"
-            temporary_index.cleanup_state = "cleanup-uncertain"
             if (
                 failure.reason == "deadline-exceeded"
                 and failure.filesystem_operation_pending_count == 0
@@ -710,7 +819,6 @@ def _cleanup_temporary_index(
                 )
             raise
         temporary_index.artifact_state = "cleanup-uncertain"
-        temporary_index.cleanup_state = "cleanup-uncertain"
         failure = _failure_metadata(
             "cleanup-failed",
             stage,
@@ -721,9 +829,9 @@ def _cleanup_temporary_index(
         _attach_failure(exc, failure)
         raise
 
+    temporary_index.cleanup_unresolved_count = unresolved
     if errors or unresolved:
         temporary_index.artifact_state = "cleanup-uncertain"
-        temporary_index.cleanup_state = "cleanup-uncertain"
         failure = _failure_metadata(
             "cleanup-failed",
             stage,
@@ -736,7 +844,6 @@ def _cleanup_temporary_index(
             raise first_error
         return failure
     temporary_index.artifact_state = "cleanup-confirmed"
-    temporary_index.cleanup_state = "cleanup-confirmed"
     return None
 
 
@@ -766,18 +873,15 @@ def _late_cleanup_owned_index(
         temporary_index.path = Path(path_text)
         temporary_index.lock_path = Path(path_text + ".lock")
         temporary_index.artifact_state = "owned"
-    temporary_index.operation_state = "completed"
     if error is not None and temporary_index.creation_result is None:
         temporary_index.artifact_state = "cleanup-uncertain"
-        temporary_index.cleanup_state = "cleanup-uncertain"
         return
     errors, unresolved, _first_error = _remove_owned_artifacts(temporary_index)
+    temporary_index.cleanup_unresolved_count = unresolved
     if errors or unresolved:
         temporary_index.artifact_state = "cleanup-uncertain"
-        temporary_index.cleanup_state = "cleanup-uncertain"
     else:
         temporary_index.artifact_state = "cleanup-confirmed"
-        temporary_index.cleanup_state = "cleanup-confirmed"
 
 
 @contextmanager
@@ -787,8 +891,11 @@ def _temporary_index(
     deadline: float,
     init_stage: str,
     cleanup_stage: str,
+    ownership: _GitCollectionOwnership | None = None,
 ) -> Iterator[_TemporaryIndex]:
     owner = _TemporaryIndex()
+    if ownership is not None:
+        ownership.register(owner)
 
     def cleanup_late_creation(value, error) -> None:
         _late_cleanup_owned_index(owner, value, error)
@@ -803,110 +910,65 @@ def _temporary_index(
         owner.path = Path(path_text)
         owner.lock_path = Path(path_text + ".lock")
         owner.artifact_state = "owned"
-        owner.operation_state = "completed"
         return fd, path_text
 
     def reserve_creation_ownership() -> None:
         owner.artifact_state = "may-exist"
-        owner.operation_state = "may-be-running"
 
+    original = None
     try:
-        fd, path_text = _bounded_filesystem_call(
+        _bounded_filesystem_call(
             create_temporary_index,
             deadline=deadline,
             stage=init_stage,
             pending_artifacts=2,
+            owner=owner,
             on_starting=reserve_creation_ownership,
             on_late_completion=cleanup_late_creation,
         )
-    except BaseException as original:
-        if getattr(original, "git_filesystem_operation_pending", False):
-            raise
-        if owner.artifact_state == "owned":
-            try:
-                cleanup_failure = _cleanup_temporary_index(
-                    owner,
-                    deadline=deadline,
-                    stage=cleanup_stage,
-                )
-            except BaseException as cleanup_error:
-                cleanup_failure = getattr(cleanup_error, "git_failure", None)
-                if not isinstance(cleanup_failure, GitFailureMetadata):
-                    cleanup_failure = _failure_metadata(
-                        "cleanup-failed",
-                        cleanup_stage,
-                        cleanup_error_count=1,
-                        temporary_artifact_unresolved_count=2,
-                        temporary_artifact_cleanup_uncertain=True,
-                    )
-            if cleanup_failure is not None:
-                _attach_failure(original, cleanup_failure, attribute="git_cleanup_failure")
-        raise
-
-    try:
         _bounded_filesystem_call(
             lambda: _close_temporary_index_descriptor(owner),
             deadline=deadline,
             stage=init_stage,
             pending_artifacts=2,
-            on_late_completion=lambda value, error: _late_cleanup_owned_index(
-                owner, value, error
-            ),
+            owner=owner,
+            on_late_completion=cleanup_late_creation,
         )
-    except BaseException as original:
-        if not getattr(original, "git_filesystem_operation_pending", False):
-            try:
-                cleanup_failure = _cleanup_temporary_index(
-                    owner,
-                    deadline=deadline,
-                    stage=cleanup_stage,
-                )
-            except BaseException as cleanup_error:
-                cleanup_failure = getattr(cleanup_error, "git_failure", None)
-                if not isinstance(cleanup_failure, GitFailureMetadata):
-                    cleanup_failure = _failure_metadata(
-                        "cleanup-failed",
-                        cleanup_stage,
-                        cleanup_error_count=1,
-                        temporary_artifact_unresolved_count=2,
-                        temporary_artifact_cleanup_uncertain=True,
-                    )
-            if cleanup_failure is not None:
-                _attach_failure(original, cleanup_failure, attribute="git_cleanup_failure")
-        raise
-
-    try:
         yield owner
-    except BaseException as original:
-        if getattr(original, "git_filesystem_operation_pending", False):
-            raise
+    except BaseException as exc:
+        original = exc
+        raise
+    finally:
+        # This guard spans acquisition, fd closure, publication, yield and exit.
+        # The owner ticket decides whether deletion is authorized, including
+        # when cancellation arrives before an exception flag can be attached.
         try:
             cleanup_failure = _cleanup_temporary_index(
-                owner,
-                deadline=deadline,
-                stage=cleanup_stage,
+                owner, deadline=deadline, stage=cleanup_stage,
             )
+            if cleanup_failure is not None:
+                raise GitCollectionError(cleanup_failure)
         except BaseException as cleanup_error:
-            cleanup_failure = getattr(cleanup_error, "git_failure", None)
-            if not isinstance(cleanup_failure, GitFailureMetadata):
-                cleanup_failure = _failure_metadata(
-                    "cleanup-failed",
-                    cleanup_stage,
-                    cleanup_error_count=1,
-                    temporary_artifact_unresolved_count=2,
-                    temporary_artifact_cleanup_uncertain=True,
-                )
-        if cleanup_failure is not None:
-            _attach_failure(original, cleanup_failure, attribute="git_cleanup_failure")
-        raise
-    else:
-        cleanup_failure = _cleanup_temporary_index(
-            owner,
-            deadline=deadline,
-            stage=cleanup_stage,
-        )
-        if cleanup_failure is not None:
-            raise GitCollectionError(cleanup_failure)
+            operation_owner = owner.filesystem_operation
+            pending = bool(operation_owner is not None and operation_owner.unsettled)
+            unresolved = (
+                operation_owner.pending_artifacts if pending else _owned_artifact_count(owner)
+            )
+            _attach_failure(
+                cleanup_error,
+                _failure_metadata(
+                    "cleanup-failed", cleanup_stage,
+                    filesystem_operation_pending_count=int(pending),
+                    temporary_artifact_unresolved_count=unresolved,
+                    temporary_artifact_cleanup_uncertain=bool(unresolved or pending),
+                ),
+            )
+            if original is None:
+                raise
+            # Cleanup may itself be interrupted. Keep the body exception and
+            # enrich both safe views rather than replacing its identity.
+            _attach_failure(original, cleanup_error.git_failure, attribute="git_cleanup_failure")
+            _attach_failure(original, cleanup_error.git_failure)
 
 
 def _copy_index_sync(
@@ -942,6 +1004,7 @@ def _copy_index(index_path: Path, temporary_index: _TemporaryIndex, *, deadline:
         deadline=deadline,
         stage="cumulative-patch-index-copy",
         pending_artifacts=2,
+        owner=temporary_index,
         on_late_completion=lambda value, error: _late_cleanup_owned_index(
             temporary_index, value, error
         ),
@@ -953,6 +1016,7 @@ def _capture_patch_with_untracked(
     baseline_commit: str,
     untracked_files: list[str],
     deadline: float,
+    ownership: _GitCollectionOwnership,
 ) -> str:
     index_path_text = _git(
         repo,
@@ -976,6 +1040,7 @@ def _capture_patch_with_untracked(
         deadline=deadline,
         init_stage=init_stage,
         cleanup_stage="cumulative-patch-index-cleanup",
+        ownership=ownership,
     ) as temporary_index:
         _copy_index(index_path, temporary_index, deadline=deadline)
         env = os.environ.copy()
@@ -1010,6 +1075,7 @@ def _capture_patch_with_untracked(
 
 def capture_evidence(*, repo: Path, baseline: GitBaseline) -> GitEvidence:
     partial = {"baseline_commit": baseline.commit}
+    ownership = _GitCollectionOwnership()
     stage = "cumulative-head"
     try:
         deadline = _new_deadline(CUMULATIVE_TIMEOUT_SECONDS)
@@ -1058,6 +1124,7 @@ def capture_evidence(*, repo: Path, baseline: GitBaseline) -> GitEvidence:
             baseline_commit=baseline.commit,
             untracked_files=untracked_files,
             deadline=deadline,
+            ownership=ownership,
         )
         partial["patch"] = patch
 
@@ -1074,6 +1141,7 @@ def capture_evidence(*, repo: Path, baseline: GitBaseline) -> GitEvidence:
         _remaining(deadline, stage)
         partial["commits"] = commits
 
+        ownership.require_complete(stage)
         return GitEvidence(
             baseline_commit=baseline.commit,
             final_head=final_head,
@@ -1083,7 +1151,7 @@ def capture_evidence(*, repo: Path, baseline: GitBaseline) -> GitEvidence:
             commits=commits,
         )
     except BaseException as exc:
-        _attach_unexpected_failure(exc, partial, stage)
+        _attach_unexpected_failure(exc, partial, stage, ownership)
         raise
 
 
@@ -1094,6 +1162,7 @@ def _capture_worktree_tree(
     observations: dict,
     observation_key: str,
     stage_prefix: str,
+    ownership: _GitCollectionOwnership,
 ) -> str:
     env = os.environ.copy()
     init_stage = f"{stage_prefix}-index-init"
@@ -1102,12 +1171,14 @@ def _capture_worktree_tree(
         deadline=deadline,
         init_stage=init_stage,
         cleanup_stage=f"{stage_prefix}-cleanup",
+        ownership=ownership,
     ) as temporary_index:
         _bounded_filesystem_call(
             lambda: temporary_index.path.unlink(missing_ok=True),
             deadline=deadline,
             stage=init_stage,
             pending_artifacts=2,
+            owner=temporary_index,
             on_late_completion=lambda value, error: _late_cleanup_owned_index(
                 temporary_index, value, error
             ),
@@ -1154,6 +1225,7 @@ def _capture_worktree_tree(
 
 def capture_worktree_snapshot(repo: Path) -> GitWorktreeSnapshot:
     partial: dict = {}
+    ownership = _GitCollectionOwnership()
     stage = "snapshot-index-init"
     try:
         deadline = _new_deadline(SNAPSHOT_TIMEOUT_SECONDS)
@@ -1163,10 +1235,12 @@ def capture_worktree_snapshot(repo: Path) -> GitWorktreeSnapshot:
             observations=partial,
             observation_key="tree",
             stage_prefix="snapshot",
+            ownership=ownership,
         )
+        ownership.require_complete("snapshot-cleanup")
         return GitWorktreeSnapshot(tree=tree)
     except BaseException as exc:
-        _attach_unexpected_failure(exc, partial, stage)
+        _attach_unexpected_failure(exc, partial, stage, ownership)
         raise
 
 
@@ -1176,6 +1250,7 @@ def capture_attempt_evidence(
     before: GitWorktreeSnapshot,
 ) -> GitAttemptEvidence:
     partial = {"before_tree": before.tree}
+    ownership = _GitCollectionOwnership()
     stage = "attempt-after-snapshot-index-init"
     try:
         deadline = _new_deadline(ATTEMPT_EVIDENCE_TIMEOUT_SECONDS)
@@ -1185,6 +1260,7 @@ def capture_attempt_evidence(
             observations=partial,
             observation_key="after_tree",
             stage_prefix="attempt-after-snapshot",
+            ownership=ownership,
         )
         partial["after_tree"] = after
 
@@ -1208,11 +1284,12 @@ def capture_attempt_evidence(
         _remaining(deadline, stage)
         partial["changed_files"] = changed_files
 
+        ownership.require_complete(stage)
         return GitAttemptEvidence(
             before_tree=before.tree,
             after_tree=after,
             changed_files=changed_files,
         )
     except BaseException as exc:
-        _attach_unexpected_failure(exc, partial, stage)
+        _attach_unexpected_failure(exc, partial, stage, ownership)
         raise
