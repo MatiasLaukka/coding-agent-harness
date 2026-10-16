@@ -149,6 +149,27 @@ process phase (64-byte stdout and 1 KiB stderr caps). Any limit, filesystem erro
 or incomplete helper result fails closed before worker setup. Large or slow
 metadata trees may therefore reject export. No inspection runs after dispatch.
 
+Report containment distinguishes three mechanisms:
+
+| Mechanism | R5 report policy |
+| --- | --- |
+| Filesystem aliases (symlinks, Windows junctions/reparse points) | Canonical root aliases are supported; aliases anywhere inside metadata remain rejected. |
+| Git-recognized layout redirects (`.git` files, `core.worktree`, linked-worktree common directories, separate Git directories) | Supported by authoritative pre-dispatch layout discovery and the existing metadata inspection. |
+| Git logical references to other object stores (regular alternates files) | Unsupported: reject any `objects/info/alternates` or `objects/info/http-alternates` entry in the inspected admin/common metadata trees. |
+
+Object storage must be self-contained within the canonical common metadata tree.
+In particular, `clone --shared` and `clone --reference` repositories with an
+alternates file reject report export, regardless of whether that file is empty,
+uses relative or absolute paths, or names an internal store. Presence detection
+uses the existing bounded metadata walk; file contents and referenced stores are
+never read, parsed, or recursively followed. `http-alternates` is rejected
+conservatively too, although the local evidence collector does not use HTTP fetch.
+Nonempty `GIT_OBJECT_DIRECTORY` and `GIT_ALTERNATE_OBJECT_DIRECTORIES` overrides
+remain rejected before layout inspection; an aliased primary `objects` directory
+remains unsupported. This policy concerns the selected target's active metadata,
+not arbitrary unrelated Git repositories. It adds no post-dispatch inspection or
+new worker, verification, or Git evidence invocation.
+
 The report retains the returned task requirements, captured outcome and findings,
 untrusted worker claims, observed worker process output and capture flags,
 independent Git paths and SHAs, ordered verification specifications and results,

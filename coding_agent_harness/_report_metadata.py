@@ -9,7 +9,7 @@ import time
 
 def inspect_metadata(roots: list[str], *, max_entries: int = 100_000,
                      max_depth: int = 64, deadline: float | None = None) -> None:
-    """Reject aliases/special files; finish the entire scan or raise.
+    """Reject aliases, alternate object references, and special files or raise.
 
     Depth-first scandir retains at most max_depth + 1 open iterators and never
     reads file contents or follows a symlink/reparse point. The parent process
@@ -19,6 +19,12 @@ def inspect_metadata(roots: list[str], *, max_entries: int = 100_000,
         raise ValueError('Metadata roots required')
     if deadline is None:
         deadline = time.monotonic() + 5
+    # These regular files are Git logical references, not filesystem aliases.
+    # Reject presence without opening content or following alternate-store chains.
+    object_references = {
+        os.path.normcase(os.path.join(root, 'objects', 'info', name))
+        for root in roots for name in ('alternates', 'http-alternates')
+    }
     entries_seen = 0
 
     def check_time() -> None:
@@ -33,6 +39,8 @@ def inspect_metadata(roots: list[str], *, max_entries: int = 100_000,
                 getattr(metadata, 'st_file_attributes', 0) &
                 getattr(stat, 'FILE_ATTRIBUTE_REPARSE_POINT', 0x400)):
             raise ValueError('Metadata aliases unsupported')
+        if os.path.normcase(path) in object_references:
+            raise ValueError('Alternate object storage unsupported')
         if stat.S_ISDIR(metadata.st_mode):
             if depth > max_depth:
                 raise ValueError('Metadata inspection depth')
