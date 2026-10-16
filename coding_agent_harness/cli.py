@@ -16,6 +16,7 @@ from .models import (
     TaskPacket,
     VerificationCommand,
 )
+from . import report
 from .orchestrator import TaskRunResult, run_task
 from .worker import QwenWorker, WorkerRunResult
 from .git import (
@@ -336,6 +337,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run_parser = subparsers.add_parser(
         "run",
         help="Run one bounded Qwen task.",
+        allow_abbrev=False,
     )
 
     run_parser.add_argument(
@@ -382,6 +384,13 @@ def _build_parser() -> argparse.ArgumentParser:
             "Worker timeout in seconds. "
             "Defaults to 600."
         ),
+    )
+
+    run_parser.add_argument(
+        "--report-dir", type=Path, metavar="DIR",
+        help="Save a uniquely named report in an existing trusted report-only directory; "
+             "operator must keep temporary and final files independent of operational inputs. "
+             "Requires --repo to be the worktree root; replaces --report PATH.",
     )
 
     handoff_parser = subparsers.add_parser(
@@ -444,6 +453,14 @@ def app(
         _print_failure_evidence(exc, stage="task-file", worker_invocation_count=0)
         return 1
 
+    report_plan = None
+    if args.report_dir is not None:
+        try:
+            report_plan = report.prepare_run_report(args.report_dir, repo_dir=repo_dir)
+        except (OSError, ValueError, RuntimeError):
+            print("Report destination error: details omitted.", file=sys.stderr)
+            return 1
+
     worker_invocation_count = 0
     try:
         worker = QwenWorker(
@@ -483,6 +500,22 @@ def app(
     _print_result(
         result
     )
+
+    if report_plan is not None:
+        try:
+            content = report.render_run_report(
+                task=spec.task, verification_commands=spec.verification_commands,
+                result=result,
+            )
+            report.publish_run_report(
+                report_plan.destination, content)
+        except (Exception, KeyboardInterrupt):
+            print("Report publication failed: captured run outcome unchanged; details omitted.",
+                  file=sys.stderr)
+            return 1
+
+        print("Report saved: " + json.dumps(str(report_plan.destination), ensure_ascii=True),
+              file=sys.stderr)
 
     if result.status == "ready-for-review":
         return 0
