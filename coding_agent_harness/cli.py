@@ -337,6 +337,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run_parser = subparsers.add_parser(
         "run",
         help="Run one bounded Qwen task.",
+        allow_abbrev=False,
     )
 
     run_parser.add_argument(
@@ -386,8 +387,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     run_parser.add_argument(
-        "--report", type=Path, metavar="PATH",
-        help="Save a completed Markdown report outside the target repository; never overwrite.",
+        "--report-dir", type=Path, metavar="DIR",
+        help="Save a uniquely named report in an existing trusted report-only directory; "
+             "operator must keep temporary and final files independent of operational inputs. "
+             "Requires --repo to be the worktree root; replaces --report PATH.",
     )
 
     handoff_parser = subparsers.add_parser(
@@ -450,13 +453,10 @@ def app(
         _print_failure_evidence(exc, stage="task-file", worker_invocation_count=0)
         return 1
 
-    report_path = None
-    report_roots = None
-    if args.report is not None:
+    report_plan = None
+    if args.report_dir is not None:
         try:
-            report_roots = report.discover_report_roots(repo_dir)
-            report_path = report.validate_report_destination(
-                args.report, repo_dir=repo_dir, protected_roots=report_roots)
+            report_plan = report.prepare_run_report(args.report_dir, repo_dir=repo_dir)
         except (OSError, ValueError, RuntimeError):
             print("Report destination error: details omitted.", file=sys.stderr)
             return 1
@@ -501,18 +501,21 @@ def app(
         result
     )
 
-    if report_path is not None:
+    if report_plan is not None:
         try:
             content = report.render_run_report(
                 task=spec.task, verification_commands=spec.verification_commands,
                 result=result,
             )
             report.publish_run_report(
-                report_path, content, repo_dir=repo_dir, protected_roots=report_roots)
+                report_plan.destination, content)
         except (Exception, KeyboardInterrupt):
             print("Report publication failed: captured run outcome unchanged; details omitted.",
                   file=sys.stderr)
             return 1
+
+        print("Report saved: " + json.dumps(str(report_plan.destination), ensure_ascii=True),
+              file=sys.stderr)
 
     if result.status == "ready-for-review":
         return 0

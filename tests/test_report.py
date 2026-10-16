@@ -100,41 +100,8 @@ def test_adversarial_markdown_cannot_add_structure():
     assert attack in report  # exact captured patch, not a normalized replacement
 
 
-@pytest.mark.parametrize("kind", ["inside", "metadata", "existing", "directory", "missing-parent", "dangling", "ads"])
-def test_reject_invalid_destinations(tmp_path, kind):
-    from coding_agent_harness.report import validate_report_destination
-    repo = layout(tmp_path)
-    destination = tmp_path / 'report.md'
-    if kind == 'inside': destination = repo / 'report.md'
-    if kind == 'metadata': destination = repo / '.git' / 'report.md'
-    if kind == 'existing': destination.write_text('keep')
-    if kind == 'directory': destination.mkdir()
-    if kind == 'missing-parent': destination = tmp_path / 'absent' / 'report.md'
-    if kind == 'ads': destination = tmp_path / 'report.md:stream'
-    if kind == 'dangling':
-        try: destination.symlink_to(tmp_path / 'absent')
-        except OSError: pytest.skip('symlink creation unavailable')
-    with pytest.raises((OSError, ValueError)):
-        validate_report_destination(destination, repo_dir=repo)
-
-
-def test_linked_worktree_and_subdirectory_metadata(tmp_path):
-    from coding_agent_harness.report import validate_report_destination
-    from tests.test_report_layout import committed_repo, git
-    main = committed_repo(tmp_path)
-    repo = tmp_path / 'linked'
-    git(main, 'worktree', 'add', '--quiet', '--detach', str(repo), 'HEAD')
-    admin = Path(git(repo, 'rev-parse', '--absolute-git-dir')).resolve()
-    common = Path(git(repo, 'rev-parse', '--path-format=absolute', '--git-common-dir')).resolve()
-    subdir = repo / 'src'
-    for path in [repo / 'bad.md', common / 'bad.md', admin / 'bad.md']:
-        with pytest.raises(ValueError): validate_report_destination(path, repo_dir=subdir)
-    assert validate_report_destination(tmp_path / 'ok.md', repo_dir=subdir) == tmp_path / 'ok.md'
-
-
 def test_publish_complete_create_only(tmp_path, monkeypatch):
     from coding_agent_harness import report
-    repo = layout(tmp_path)
     destination = tmp_path / 'report.md'
     real_link = os.link
     def observe(source, target):
@@ -142,18 +109,17 @@ def test_publish_complete_create_only(tmp_path, monkeypatch):
         assert Path(source).read_bytes() == 'complete π\n'.encode()
         real_link(source, target)
     monkeypatch.setattr(report.os, 'link', observe)
-    report.publish_run_report(destination, 'complete π\n', repo_dir=repo)
+    report.publish_run_report(destination, 'complete π\n')
     assert destination.read_bytes() == 'complete π\n'.encode()
     with pytest.raises((OSError, ValueError)):
-        report.publish_run_report(destination, 'overwrite', repo_dir=repo)
+        report.publish_run_report(destination, 'overwrite')
     assert destination.read_text(encoding='utf-8') == 'complete π\n'
-    assert sorted(p.name for p in tmp_path.iterdir()) == ['repo', 'report.md']
+    assert sorted(p.name for p in tmp_path.iterdir()) == ['report.md']
 
 
 @pytest.mark.parametrize('failure', ['race', 'link', 'write', 'fsync'])
 def test_publication_failure_never_exposes_partial_file(tmp_path, monkeypatch, failure):
     from coding_agent_harness import report
-    repo = layout(tmp_path)
     destination = tmp_path / 'report.md'
     def fail(*args, **kwargs): raise OSError('private error detail')
     if failure in ('race', 'link'):
@@ -174,7 +140,7 @@ def test_publication_failure_never_exposes_partial_file(tmp_path, monkeypatch, f
                 self.file.write(data[:3])
                 raise OSError('partial write')
         monkeypatch.setattr(report.os, 'fdopen', lambda fd, mode: Broken(fd))
-    with pytest.raises(OSError): report.publish_run_report(destination, 'complete report', repo_dir=repo)
+    with pytest.raises(OSError): report.publish_run_report(destination, 'complete report')
     assert destination.exists() == (failure == 'race')
     if destination.exists(): assert destination.read_text() == 'winner'
     assert not list(tmp_path.glob('.harness-report-*'))
@@ -196,34 +162,9 @@ def test_renderer_does_not_access_filesystem_or_execute(tmp_path, monkeypatch):
     assert '## Captured patch' in content
 
 
-def test_destination_symlink_alias_into_repo_is_rejected(tmp_path):
-    from coding_agent_harness.report import validate_report_destination
-    repo = layout(tmp_path)
-    alias = tmp_path / 'alias'
-    try: alias.symlink_to(repo, target_is_directory=True)
-    except OSError: pytest.skip('symlink creation unavailable')
-    with pytest.raises(ValueError):
-        validate_report_destination(alias / 'report.md', repo_dir=repo)
-
-
-@pytest.mark.parametrize('kind', ['malformed', 'oversized', 'missing-admin', 'empty-common', 'override'])
-def test_unknown_git_layout_fails_closed(tmp_path, monkeypatch, kind):
-    from coding_agent_harness.report import validate_report_destination
-    repo = layout(tmp_path)
-    marker = repo / '.git'
-    if kind in ('malformed', 'oversized', 'missing-admin'):
-        marker.rename(repo / 'saved-metadata')
-        marker.write_text('invalid' if kind == 'malformed' else 'x' * 4097 if kind == 'oversized' else 'gitdir: absent')
-    if kind == 'empty-common': (marker / 'commondir').write_text('')
-    if kind == 'override': monkeypatch.setenv('GIT_DIR', str(tmp_path / 'elsewhere'))
-    with pytest.raises((OSError, ValueError)):
-        validate_report_destination(tmp_path / 'report.md', repo_dir=repo)
-
-
 @pytest.mark.parametrize('failure', ['short-write', 'fdopen'])
 def test_failed_write_or_stream_acquisition_closes_owned_descriptor(tmp_path, monkeypatch, failure):
     from coding_agent_harness import report
-    repo = layout(tmp_path)
     destination = tmp_path / 'report.md'
     real_fdopen = os.fdopen
     descriptors = []
@@ -238,14 +179,13 @@ def test_failed_write_or_stream_acquisition_closes_owned_descriptor(tmp_path, mo
         return ShortWriter(fd)
     monkeypatch.setattr(report.os, 'fdopen', acquire)
     with pytest.raises(OSError):
-        report.publish_run_report(destination, 'complete', repo_dir=repo)
+        report.publish_run_report(destination, 'complete')
     with pytest.raises(OSError): os.fstat(descriptors[0])
     assert not destination.exists() and not list(tmp_path.glob('.harness-report-*'))
 
 
 def test_cleanup_failure_reports_error_even_after_complete_publication(tmp_path, monkeypatch):
     from coding_agent_harness import report
-    repo = layout(tmp_path)
     destination = tmp_path / 'report.md'
     real_unlink = Path.unlink
     def fail(path, *a, **kw):
@@ -254,7 +194,7 @@ def test_cleanup_failure_reports_error_even_after_complete_publication(tmp_path,
     monkeypatch.setattr(Path, 'unlink', fail)
     try:
         with pytest.raises(PermissionError):
-            report.publish_run_report(destination, 'complete', repo_dir=repo)
+            report.publish_run_report(destination, 'complete')
         assert destination.read_text() == 'complete'
     finally:
         for temporary in tmp_path.glob('.harness-report-*'): real_unlink(temporary)
@@ -266,3 +206,43 @@ def test_explicit_empty_allowlist_is_not_described_as_unspecified():
     packet.allowed_files = []
     content = render_run_report(task=packet, verification_commands=[], result=sample())
     assert 'No files allowed' in content
+
+
+def test_concurrent_publications_are_complete_and_create_only(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+    from coding_agent_harness import report
+    destination = tmp_path / 'report.md'
+    barrier = Barrier(2)
+    def publish(content):
+        barrier.wait(timeout=10)
+        try:
+            report.publish_run_report(destination, content)
+            return 'published'
+        except FileExistsError:
+            return 'collision'
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(publish, ['first' * 1000, 'second' * 1000]))
+    assert sorted(results) == ['collision', 'published']
+    assert destination.read_text() in ('first' * 1000, 'second' * 1000)
+    assert not list(tmp_path.glob('.harness-report-*'))
+
+
+def test_publisher_has_no_git_dependency(tmp_path, monkeypatch):
+    from coding_agent_harness import report
+    def forbidden(*a, **kw): pytest.fail('publisher queried Git')
+    monkeypatch.setattr(report, 'run_process', forbidden)
+    report.publish_run_report(tmp_path / 'report.md', 'captured')
+    assert (tmp_path / 'report.md').read_text() == 'captured'
+
+
+def test_unsupported_hard_links_have_no_overwrite_fallback(tmp_path, monkeypatch):
+    import errno
+    from coding_agent_harness import report
+    def unsupported(*a, **kw): raise OSError(errno.EOPNOTSUPP, 'hard links unsupported')
+    def forbidden(*a, **kw): pytest.fail('overwrite fallback')
+    monkeypatch.setattr(report.os, 'link', unsupported)
+    monkeypatch.setattr(report.os, 'replace', forbidden)
+    monkeypatch.setattr(report.os, 'rename', forbidden)
+    with pytest.raises(OSError): report.publish_run_report(tmp_path / 'report.md', 'complete')
+    assert not list(tmp_path.iterdir())
