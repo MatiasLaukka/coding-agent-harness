@@ -138,6 +138,17 @@ failed/incomplete discovery, ambiguous multiline paths, and unrecognized or over
 4 KiB Git layout files fail closed. Git layout environment overrides remain
 unsupported.
 
+Before dispatch, a separate isolated Python helper completely inspects the
+canonical admin/common metadata trees without following symlinks. Metadata
+symlinks (including internal, dangling, and file symlinks), Windows junctions and
+other reparse points, and special files are unsupported and reject report export.
+Root aliases remain supported after canonicalization. Inspection reads directory
+entries and file metadata only, with a combined 100,000-entry limit, maximum
+directory depth 64, and 5-second cooperative budget inside a 10-second bounded
+process phase (64-byte stdout and 1 KiB stderr caps). Any limit, filesystem error,
+or incomplete helper result fails closed before worker setup. Large or slow
+metadata trees may therefore reject export. No inspection runs after dispatch.
+
 The report retains the returned task requirements, captured outcome and findings,
 untrusted worker claims, observed worker process output and capture flags,
 independent Git paths and SHAs, ordered verification specifications and results,

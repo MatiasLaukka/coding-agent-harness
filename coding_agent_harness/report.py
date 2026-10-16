@@ -5,6 +5,7 @@ import html
 import json
 import os
 import re
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -146,6 +147,18 @@ def discover_report_roots(repo_dir: Path) -> tuple[Path, ...]:
         raise ValueError('Cannot bind Git discovery location')
     if any(not root.is_dir() for root in roots):
         raise ValueError('Invalid Git layout directories')
+    # Inspect the complete canonical metadata trees before freezing roots.
+    # Reject aliases instead of following an unbounded graph of metadata paths.
+    metadata_roots = [common] if admin.is_relative_to(common) else [admin, common]
+    inspection = run_process(
+        argv=[sys.executable, '-I', str(Path(__file__).with_name('_report_metadata.py')),
+              *(str(root) for root in metadata_roots)],
+        cwd=supplied, timeout_seconds=10, deadline=time.monotonic() + 10,
+        stdout_limit_bytes=64, stderr_limit_bytes=1024,
+    )
+    if (inspection.infrastructure_failed or inspection.exit_code != 0 or
+            inspection.stdout != 'metadata-layout-ok\n' or inspection.stderr):
+        raise ValueError('Git metadata inspection failed')
     return tuple(dict.fromkeys(roots))
 
 

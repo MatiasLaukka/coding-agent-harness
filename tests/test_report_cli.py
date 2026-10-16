@@ -124,7 +124,10 @@ def test_real_offline_run_report_does_not_recollect_or_redispatch(tmp_path, monk
         def call(*a, **kw):
             if owner is report:
                 assert 'run' not in counts, 'Git layout discovery occurred after worker dispatch'
-            counts[name] = counts.get(name, 0) + 1
+            key = name
+            if owner is report:
+                key = 'layout_query' if kw['argv'][0] == 'git' else 'metadata_inspection'
+            counts[key] = counts.get(key, 0) + 1
             return original(*a, **kw)
         monkeypatch.setattr(owner, name, call)
     for name in ('capture_baseline', 'capture_evidence', 'run_verification'):
@@ -136,7 +139,7 @@ def test_real_offline_run_report_does_not_recollect_or_redispatch(tmp_path, monk
     destination = tmp_path / 'report.md'
     assert cli.app(args(repo, spec, destination if with_report else None)) == (0 if complete else 2)
     expected_counts = {'capture_baseline': 1, 'capture_evidence': 1, 'run_verification': 1, 'run': 1}
-    if with_report: expected_counts['run_process'] = 1
+    if with_report: expected_counts.update(layout_query=1, metadata_inspection=1)
     assert counts == expected_counts
     assert capsys.readouterr().err == ''
     assert destination.exists() == with_report
