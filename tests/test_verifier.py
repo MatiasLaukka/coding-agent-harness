@@ -277,3 +277,25 @@ def test_advisory_failure_does_not_break_verification(
     assert check.expectation == "advisory"
     assert check.expectation_met is None
     assert result.passed is True
+
+def test_verifier_opt_in_passes_devnull_to_common_runner(tmp_path, monkeypatch):
+    import coding_agent_harness.verifier as verifier_module
+    from coding_agent_harness.models import VerificationCommand
+    from coding_agent_harness.process import ProcessResult
+
+    captured = {}
+    def fake_run_process(**kwargs):
+        captured.update(kwargs)
+        return ProcessResult(
+            argv=kwargs["argv"], exit_code=0, stdout="ok", stderr="",
+            timed_out=False, elapsed_seconds=0.01,
+        )
+    monkeypatch.setattr(verifier_module, "run_process", fake_run_process)
+
+    verifier_module.run_verification(
+        repo_dir=tmp_path,
+        commands=[VerificationCommand(id="offline", argv=["python", "-c", "pass"])],
+        stdin_devnull=True,
+    )
+
+    assert captured["stdin_devnull"] is True

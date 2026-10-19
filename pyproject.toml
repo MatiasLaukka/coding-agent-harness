@@ -24,6 +24,7 @@ dev = [
 
 [project.scripts]
 coding-harness = "coding_agent_harness.cli:app"
+coding-agent-harness = "coding_agent_harness.cli:app"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

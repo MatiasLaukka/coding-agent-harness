@@ -143,3 +143,23 @@ def test_timeout_kills_child_process_tree(
     assert not psutil.pid_exists(
         child_pid
     )
+
+def test_run_process_stdin_devnull_is_opt_in(tmp_path: Path, monkeypatch) -> None:
+    import subprocess
+    import coding_agent_harness.process as process_module
+
+    observed = []
+    original = subprocess.Popen
+
+    def observe(*args, **kwargs):
+        observed.append(kwargs.get("stdin"))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(process_module.subprocess, "Popen", observe)
+    run_process(argv=[sys.executable, "-c", "print('default')"], cwd=tmp_path, timeout_seconds=10)
+    run_process(
+        argv=[sys.executable, "-c", "print('isolated')"], cwd=tmp_path,
+        timeout_seconds=10, stdin_devnull=True,
+    )
+
+    assert observed == [None, subprocess.DEVNULL]

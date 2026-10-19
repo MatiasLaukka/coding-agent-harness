@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import math
 import os
 import re
@@ -28,6 +29,7 @@ ATTEMPT_EVIDENCE_TIMEOUT_SECONDS = 30
 # Per-command capture limits. The patch remains textual Git --binary output.
 GIT_STDOUT_LIMIT_BYTES = 1024 * 1024
 GIT_PATCH_STDOUT_LIMIT_BYTES = 8 * 1024 * 1024
+GIT_INDEX_STDOUT_LIMIT_BYTES = 4 * 1024 * 1024
 GIT_STDERR_LIMIT_BYTES = 64 * 1024
 
 _INDEX_COPY_CHUNK_BYTES = 64 * 1024
@@ -64,6 +66,7 @@ _GIT_FAILURE_STAGES = frozenset({
     "cumulative-patch-index-cleanup",
     "cumulative-patch",
     "cumulative-commits",
+    "cumulative-index-entries",
     "attempt-after-snapshot-index-init",
     "attempt-after-snapshot-read-tree",
     "attempt-after-snapshot-add",
@@ -123,6 +126,7 @@ class GitEvidence(StrictModel):
     changed_files: list[str]
     patch: str
     commits: list[str]
+    index_fingerprint: str | None = None
 
 
 class GitWorktreeSnapshot(StrictModel):
@@ -472,7 +476,8 @@ def _git(
     env: dict[str, str] | None = None,
     stdout_limit_bytes: int = GIT_STDOUT_LIMIT_BYTES,
     temporary_index: _TemporaryIndex | None = None,
-) -> str:
+    raw_output: bool = False,
+) -> str | bytes:
     remaining = _remaining(deadline, stage)
     if temporary_index is not None:
         temporary_index.process_may_be_active = True
@@ -486,6 +491,7 @@ def _git(
             deadline=deadline,
             stdout_limit_bytes=stdout_limit_bytes,
             stderr_limit_bytes=GIT_STDERR_LIMIT_BYTES,
+            capture_stdout_bytes=True,
         )
     except BaseException as exc:
         process_result = getattr(exc, "process_result", None)
@@ -530,7 +536,39 @@ def _git(
             process_result=result,
             stdout_limit_bytes=stdout_limit_bytes,
         )
-    return result.stdout
+    if not isinstance(result.raw_stdout_bytes, bytes):
+        _raise_git_failure(
+            "incomplete-collection", stage,
+            stdout_limit_bytes=stdout_limit_bytes,
+        )
+    if raw_output:
+        return result.raw_stdout_bytes
+    try:
+        return result.raw_stdout_bytes.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        _raise_git_failure(
+            "incomplete-collection", stage,
+            stdout_limit_bytes=stdout_limit_bytes,
+        )
+
+def _capture_index_fingerprint(*, repo: Path, deadline: float) -> str:
+    output = _git(
+        repo,
+        "ls-files",
+        "--stage",
+        "-z",
+        deadline=deadline,
+        stage="cumulative-index-entries",
+        stdout_limit_bytes=GIT_INDEX_STDOUT_LIMIT_BYTES,
+        raw_output=True,
+    )
+    if not isinstance(output, bytes):
+        _raise_git_failure(
+            "incomplete-collection", "cumulative-index-entries",
+            stdout_limit_bytes=GIT_INDEX_STDOUT_LIMIT_BYTES,
+        )
+    return hashlib.sha256(b"harness-index-entries-v1\0" + output).hexdigest()
+
 
 def _require_object_id(output: str, stage: str) -> str:
     value = output.strip()
@@ -1141,6 +1179,11 @@ def capture_evidence(*, repo: Path, baseline: GitBaseline) -> GitEvidence:
         _remaining(deadline, stage)
         partial["commits"] = commits
 
+        stage = "cumulative-index-entries"
+        index_fingerprint = _capture_index_fingerprint(repo=repo, deadline=deadline)
+        partial["index_fingerprint"] = index_fingerprint
+        _remaining(deadline, stage)
+
         ownership.require_complete(stage)
         return GitEvidence(
             baseline_commit=baseline.commit,
@@ -1149,6 +1192,7 @@ def capture_evidence(*, repo: Path, baseline: GitBaseline) -> GitEvidence:
             changed_files=changed_files,
             patch=patch,
             commits=commits,
+            index_fingerprint=index_fingerprint,
         )
     except BaseException as exc:
         _attach_unexpected_failure(exc, partial, stage, ownership)

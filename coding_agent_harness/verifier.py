@@ -97,6 +97,7 @@ def run_verification(
     *,
     repo_dir: Path,
     commands: Sequence[VerificationCommand],
+    stdin_devnull: bool = False,
 ) -> VerificationResult:
     checks: list[VerificationCheck] = []
     overall_passed = True
@@ -104,11 +105,14 @@ def run_verification(
     command = None
     try:
         for command in commands:
-            process = run_process(
-                argv=command.argv,
-                cwd=repo_dir,
-                timeout_seconds=command.timeout_seconds,
-            )
+            process_kwargs = {
+                "argv": command.argv,
+                "cwd": repo_dir,
+                "timeout_seconds": command.timeout_seconds,
+            }
+            if stdin_devnull:
+                process_kwargs["stdin_devnull"] = True
+            process = run_process(**process_kwargs)
 
             passed = (
                 not process.infrastructure_failed

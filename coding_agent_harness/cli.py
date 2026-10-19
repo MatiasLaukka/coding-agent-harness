@@ -21,6 +21,7 @@ from .orchestrator import TaskRunResult, run_task
 from .worker import QwenWorker, WorkerRunResult
 from .git import (
     GIT_PATCH_STDOUT_LIMIT_BYTES,
+    GIT_INDEX_STDOUT_LIMIT_BYTES,
     GIT_STDERR_LIMIT_BYTES,
     GIT_STDOUT_LIMIT_BYTES,
     GitBaseline,
@@ -243,7 +244,10 @@ def _git_failure_summary(metadata: object) -> dict:
         result["stage"] = metadata.stage
     if type(metadata.exit_code) is int and -255 <= metadata.exit_code <= 255:
         result["exit_code"] = metadata.exit_code
-    stdout_limits = {GIT_STDOUT_LIMIT_BYTES, GIT_PATCH_STDOUT_LIMIT_BYTES}
+    stdout_limits = {
+        GIT_STDOUT_LIMIT_BYTES, GIT_PATCH_STDOUT_LIMIT_BYTES,
+        GIT_INDEX_STDOUT_LIMIT_BYTES,
+    }
     if type(metadata.stdout_limit_bytes) is int and metadata.stdout_limit_bytes in stdout_limits:
         result["stdout_limit_bytes"] = metadata.stdout_limit_bytes
     if type(metadata.stderr_limit_bytes) is int and metadata.stderr_limit_bytes == GIT_STDERR_LIMIT_BYTES:
@@ -393,6 +397,26 @@ def _build_parser() -> argparse.ArgumentParser:
              "Requires --repo to be the worktree root; replaces --report PATH.",
     )
 
+    control_parser = subparsers.add_parser(
+        "control", help="Run a human-reviewed foreground controller workflow.", allow_abbrev=False,
+    )
+    control_parser.add_argument("task_file", type=Path, help="JSON task specification.")
+    control_parser.add_argument("--repo", required=True, type=Path,
+                                help="Canonical repository worktree root.")
+    control_parser.add_argument("--model", required=True, help="Worker model identifier.")
+    control_parser.add_argument(
+        "--worker-command", "--qwen-command", dest="worker_command", default="qwen",
+        help="Worker launcher executable; the harness supplies model and task arguments.",
+    )
+    control_parser.add_argument("--worker-timeout", type=_positive_float, default=600.0,
+                                 help="Worker timeout in seconds (maximum 14,400).")
+    control_parser.add_argument("--max-remediation-attempts", type=int, choices=(0, 1), default=0,
+                                 help="Human-authorized additional worker attempts (0 or 1).")
+    control_parser.add_argument("--review-timeout", type=int, default=300,
+                                 help="Each START/review transaction deadline in seconds (1-1,800).")
+    control_parser.add_argument("--record-dir", required=True, type=Path,
+                                 help="Existing trusted record-only directory outside repository resources.")
+
     handoff_parser = subparsers.add_parser(
         "handoff", help="Validate supervisor documents; never execute proposals.")
     handoff_commands = handoff_parser.add_subparsers(dest="handoff_command", required=True)
@@ -418,6 +442,9 @@ def app(
 ) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
+
+    if args.command == "control":
+        return _control_app(args)
 
     if args.command == "handoff":
         return _handoff_app(args)
@@ -521,6 +548,12 @@ def app(
         return 0
 
     return 2
+
+
+def _control_app(args) -> int:
+    from .control import run_control
+
+    return run_control(args)
 
 
 def _handoff_app(args) -> int:

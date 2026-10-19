@@ -263,6 +263,7 @@ class QwenWorker:
         command: Sequence[str],
         model: str,
         timeout_seconds: float,
+        stdin_devnull: bool = False,
     ) -> None:
         if not command:
             raise ValueError(
@@ -283,9 +284,21 @@ class QwenWorker:
             command
         )
         self.model = model
+        if type(stdin_devnull) is not bool:
+            raise ValueError("stdin_devnull must be a boolean")
         self.timeout_seconds = (
             timeout_seconds
         )
+        self.stdin_devnull = stdin_devnull
+
+    def command_for(self, task: TaskPacket) -> list[str]:
+        return [
+            *self.command,
+            "--model",
+            self.model,
+            "-p",
+            _render_task_prompt(task),
+        ]
 
     def run(
         self,
@@ -293,25 +306,15 @@ class QwenWorker:
         task: TaskPacket,
         repo_dir: Path,
     ) -> WorkerRunResult:
-        prompt = _render_task_prompt(
-            task
-        )
-
-        argv = [
-            *self.command,
-            "--model",
-            self.model,
-            "-p",
-            prompt,
-        ]
-
-        process = run_process(
-            argv=argv,
-            cwd=repo_dir,
-            timeout_seconds=(
-                self.timeout_seconds
-            ),
-        )
+        argv = self.command_for(task)
+        process_kwargs = {
+            "argv": argv,
+            "cwd": repo_dir,
+            "timeout_seconds": self.timeout_seconds,
+        }
+        if self.stdin_devnull:
+            process_kwargs["stdin_devnull"] = True
+        process = run_process(**process_kwargs)
 
         if process.stdout_truncated or not process.output_complete:
             completion, completion_error = None, "incomplete stdout; completion cannot be validated"

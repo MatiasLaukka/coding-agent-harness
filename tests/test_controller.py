@@ -1,6 +1,7 @@
 from pathlib import Path
 import pytest
 from coding_agent_harness.git import GitAttemptEvidence, GitEvidence
+from coding_agent_harness.git import GitBaseline
 import coding_agent_harness.controller as controller_module
 
 from coding_agent_harness.controller import (
@@ -94,6 +95,30 @@ def make_task(
         ],
         allowed_files=allowed_files,
     )
+
+
+
+def test_controller_rejects_changed_approved_baseline_before_dispatch(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    worker = FakeWorker()
+    reviewer = FakeReviewer([])
+    controller = HarnessController(worker=worker, reviewer=reviewer, max_remediation_attempts=0)
+    approved = GitBaseline(commit="a" * 40, status="")
+    actual = GitBaseline(commit="b" * 40, status="")
+    monkeypatch.setattr(controller_module, "capture_baseline", lambda repo: actual)
+
+    with pytest.raises(ValueError, match="approved baseline"):
+        controller.run(
+            task=make_task(allowed_files=["src/example.py"]),
+            repo_dir=tmp_path,
+            verification_commands=[],
+            expected_baseline=approved,
+        )
+
+    assert worker.calls == 0
+    assert reviewer.calls == 0
 
 @pytest.fixture(autouse=True)
 def stub_per_attempt_git_evidence(
