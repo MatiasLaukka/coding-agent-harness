@@ -15,11 +15,12 @@ from coding_agent_harness.worker import WorkerRunResult
 
 
 class FakeConsole:
-    def __init__(self, lines):
+    def __init__(self, lines, *, on_read=None):
         self.lines = list(lines)
         self.output = []
         self.discard_count = 0
         self.deadlines = []
+        self.on_read = on_read
 
     def __enter__(self):
         return self
@@ -35,6 +36,8 @@ class FakeConsole:
 
     def read_line(self, *, deadline):
         self.deadlines.append(deadline)
+        if self.on_read is not None:
+            self.on_read(len(self.deadlines), self)
         if not self.lines:
             raise RuntimeError("unexpected input read")
         item = self.lines.pop(0)
@@ -160,7 +163,11 @@ def test_control_accepts_only_after_start_and_publishes_terminal(tmp_path):
     assert start["approved_clean_baseline"]["commit"] == git(repo, "rev-parse", "HEAD")
     assert terminal["controller_result"]["status"] == "accepted"
     assert terminal["worker_invocation_observation"]["count"] == 1
-    assert terminal["review_records"][0]["controller_callback_returned"] is True
+    reference = terminal["review_records"][0]
+    assert reference["decision_record_published"] is True
+    assert reference["final_freshness_validation_completed"] is True
+    assert reference["controller_decision_receipt"] == "observed"
+    assert reference["controller_decision_processed"] is True
 
 
 def test_one_human_remediation_is_frozen_and_no_third_attempt_is_possible(tmp_path):
@@ -200,6 +207,10 @@ def test_one_human_remediation_is_frozen_and_no_third_attempt_is_possible(tmp_pa
     assert terminal["controller_result"]["status"] == "stopped"
     assert terminal["controller_result"]["attempts"] == 2
     assert terminal["worker_invocation_observation"]["count"] == 2
+    assert all(reference["decision_record_published"] for reference in terminal["review_records"])
+    assert all(reference["final_freshness_validation_completed"] for reference in terminal["review_records"])
+    assert all(reference["controller_decision_receipt"] == "observed" for reference in terminal["review_records"])
+    assert all(reference["controller_decision_processed"] for reference in terminal["review_records"])
     assert "No remediation attempt remains" in "".join(console.output)
 
 
@@ -270,6 +281,55 @@ def test_verification_induced_git_change_fails_before_human_action(tmp_path):
     terminal = json.loads(next(records.glob("terminal-*.json")).read_text(encoding="utf-8"))
     assert terminal["workflow_failure"]["exception_type"] == "EvidenceFreshnessError"
     assert terminal["worker_invocation_observation"]["count"] == 1
+
+
+def test_interrupt_before_human_callback_return_does_not_claim_controller_receipt(tmp_path):
+    import inspect
+
+    repo, records = make_repo(tmp_path)
+    task_file = tmp_path / "task.json"
+    write_task(task_file)
+    console = FakeConsole(["START A1B2C3D4", "ACCEPT E5F6A7B8", "looks good"])
+    instances = []
+    source, first_line = inspect.getsourcelines(control.HumanReviewer.review)
+    return_line = first_line + next(index for index, line in enumerate(source) if line.strip() == "return decision")
+    injected = False
+
+    def interrupt_before_return(frame, event, _argument):
+        nonlocal injected
+        if (
+            not injected and event == "line" and frame.f_code is control.HumanReviewer.review.__code__
+            and frame.f_lineno == return_line
+        ):
+            injected = True
+            sys.settrace(None)
+            raise KeyboardInterrupt()
+        return interrupt_before_return
+
+    sys.settrace(interrupt_before_return)
+    try:
+        status = control.run_control(
+            args_for(repo, records, task_file), console_factory=lambda: console,
+            worker_factory=make_worker_factory(records, instances),
+            challenge_factory=codes("A1B2C3D4", "E5F6A7B8"),
+        )
+    finally:
+        sys.settrace(None)
+
+    terminal = json.loads(next(records.glob("terminal-*.json")).read_text(encoding="utf-8"))
+    reference = terminal["review_records"][0]
+    controller_evidence = terminal["native_evidence"]["harness_evidence"]
+    assert injected is True
+    assert status == 130
+    assert len(instances[0].calls) == 1
+    assert terminal["controller_result"] is None
+    assert controller_evidence["stage"] == "review"
+    assert "decision" not in controller_evidence["attempts"][-1]
+    assert reference["final_freshness_validation_completed"] is True
+    assert reference["decision_record_published"] is True
+    assert reference["controller_decision_receipt"] == "unknown"
+    assert reference["controller_decision_processed"] is False
+    assert "controller_callback_returned" not in reference
 
 
 def test_start_record_publication_failure_never_dispatches_worker(tmp_path, monkeypatch):
@@ -350,3 +410,134 @@ def test_control_admission_rejects_missing_scope_duplicate_checks_and_advisory_o
     task_file.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(control.ControlAdmissionError, match="required"):
         control._load_control_task_file(task_file)
+
+
+def _commit_protected_file(repo):
+    (repo / "protected.txt").write_text("protected baseline\n", encoding="utf-8")
+    git(repo, "add", "protected.txt")
+    git(repo, "commit", "-m", "add protected file")
+
+
+def _set_index_flag(repo, flag, path="protected.txt"):
+    git(repo, "update-index", flag, path)
+
+
+@pytest.mark.parametrize("flag", ["--assume-unchanged", "--skip-worktree", "--both"])
+def test_control_rejects_preexisting_index_flags_before_start_authorization(tmp_path, flag):
+    repo, records = make_repo(tmp_path)
+    task_file = tmp_path / "task.json"
+    write_task(task_file)
+    selected_flag = "--assume-unchanged" if flag == "--both" else flag
+    _set_index_flag(repo, selected_flag, "src/example.txt")
+    if flag == "--both":
+        _set_index_flag(repo, "--skip-worktree", "src/example.txt")
+    console = FakeConsole(["START A1B2C3D4", "STOP", "operator stop"])
+    instances = []
+
+    status = control.run_control(
+        args_for(repo, records, task_file), console_factory=lambda: console,
+        worker_factory=make_worker_factory(records, instances),
+        challenge_factory=codes("A1B2C3D4", "E5F6A7B8"),
+    )
+
+    assert status == 1
+    assert all(not worker.calls for worker in instances)
+    assert not list(records.glob("start-*.json"))
+    assert not any("validated_task" in output for output in console.output)
+    assert json.loads(next(records.glob("terminal-*.json")).read_text(encoding="utf-8"))["worker_invocation_observation"]["count"] == 0
+
+
+@pytest.mark.parametrize("flag", ["--assume-unchanged", "--skip-worktree"])
+def test_index_flag_added_by_worker_fails_at_post_worker_evidence(tmp_path, flag):
+    repo, records = make_repo(tmp_path)
+    _commit_protected_file(repo)
+    task_file = tmp_path / "task.json"
+    write_task(task_file)
+    console = FakeConsole(["START A1B2C3D4", "ACCEPT E5F6A7B8", "looks good"])
+    instances = []
+
+    def factory(*, command, model, timeout_seconds, stdin_devnull):
+        class FlaggedWorker(SyntheticWorker):
+            def run(self, *, task, repo_dir):
+                result = super().run(task=task, repo_dir=repo_dir)
+                _set_index_flag(repo_dir, flag)
+                (repo_dir / "protected.txt").write_text("hidden out-of-scope edit\n", encoding="utf-8")
+                return result
+
+        worker = FlaggedWorker(
+            command=command, model=model, timeout_seconds=timeout_seconds,
+            stdin_devnull=stdin_devnull, records=records,
+        )
+        instances.append(worker)
+        return worker
+
+    status = control.run_control(
+        args_for(repo, records, task_file), console_factory=lambda: console,
+        worker_factory=factory,
+        challenge_factory=codes("A1B2C3D4", "E5F6A7B8"),
+    )
+
+    assert status == 1
+    assert len(instances[0].calls) == 1
+    terminal = json.loads(next(records.glob("terminal-*.json")).read_text(encoding="utf-8"))
+    assert terminal["controller_result"] is None
+    assert terminal["workflow_failure"]["controller_stage"] == "git-evidence"
+
+
+@pytest.mark.parametrize("flag", ["--assume-unchanged", "--skip-worktree"])
+def test_verifier_index_flag_and_out_of_scope_edit_fail_at_review_entry(tmp_path, flag):
+    repo, records = make_repo(tmp_path)
+    _commit_protected_file(repo)
+    task_file = tmp_path / "task.json"
+    verifier = tmp_path / "mutate.py"
+    verifier.write_text(
+        "import subprocess\nfrom pathlib import Path\n"
+        f"subprocess.run(['git','update-index',{flag!r},'protected.txt'], cwd={str(repo)!r}, check=True)\n"
+        f"Path({str(repo / 'protected.txt')!r}).write_text('hidden verifier edit\\n', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    write_task(task_file, commands=[{
+        "id": "mutating-check", "argv": [sys.executable, str(verifier)], "timeout_seconds": 20,
+    }])
+    console = FakeConsole(["START A1B2C3D4"])
+    instances = []
+
+    status = control.run_control(
+        args_for(repo, records, task_file), console_factory=lambda: console,
+        worker_factory=make_worker_factory(records, instances),
+        challenge_factory=codes("A1B2C3D4", "E5F6A7B8"),
+    )
+
+    assert status == 1
+    assert len(instances[0].calls) == 1
+    review = json.loads(next(records.glob("review-*.json")).read_text(encoding="utf-8"))
+    assert review["human_decision"] is None
+    assert review["nondecision"]["stage"] == "review-entry"
+
+
+@pytest.mark.parametrize("flag", ["--assume-unchanged", "--skip-worktree"])
+def test_index_flag_and_out_of_scope_edit_during_review_abort_final_freshness(tmp_path, flag):
+    repo, records = make_repo(tmp_path)
+    _commit_protected_file(repo)
+    task_file = tmp_path / "task.json"
+    write_task(task_file)
+
+    def on_read(number, _console):
+        if number == 3:  # rationale follows the confirmed ACCEPT action
+            _set_index_flag(repo, flag)
+            (repo / "protected.txt").write_text("hidden in-review edit\n", encoding="utf-8")
+
+    console = FakeConsole(["START A1B2C3D4", "ACCEPT E5F6A7B8", "looks good"], on_read=on_read)
+    instances = []
+    status = control.run_control(
+        args_for(repo, records, task_file), console_factory=lambda: console,
+        worker_factory=make_worker_factory(records, instances),
+        challenge_factory=codes("A1B2C3D4", "E5F6A7B8"),
+    )
+
+    assert status == 1
+    assert len(instances[0].calls) == 1
+    review = json.loads(next(records.glob("review-*.json")).read_text(encoding="utf-8"))
+    terminal = json.loads(next(records.glob("terminal-*.json")).read_text(encoding="utf-8"))
+    assert review["human_decision"]["requested_action"] == "accept"
+    assert terminal["controller_result"] is None

@@ -76,7 +76,8 @@ def fixtures(tmp_path):
     evidence = GitEvidence(
         baseline_commit=baseline.commit, final_head=baseline.commit, final_status=" M src/example.txt",
         changed_files=["src/example.txt"], patch="diff --git a/src/example.txt b/src/example.txt\n+unsafe\x1b[2J\u202e\n",
-        commits=[], index_fingerprint="b" * 64,
+        commits=[], index_fingerprint="b" * 64, patch_sha256="d" * 64,
+        index_flags_fingerprint="e" * 64, unsupported_index_flag_count=0,
     )
     check = VerificationCheck(
         argv=["python", "-c", "print('check')"], exit_code=0, stdout="check output",
@@ -115,8 +116,9 @@ def test_acceptance_challenge_is_fresh_and_recorded_before_callback_returns(tmp_
     reviewer = make_reviewer(tmp_path, console)
     calls = 0
 
-    def fresh(*, repo, baseline):
+    def fresh(*, repo, baseline, inspect_index_flags):
         nonlocal calls
+        assert inspect_index_flags is True
         calls += 1
         if calls == 2:
             files = list((tmp_path / "records").glob("review-*.json"))
@@ -130,7 +132,8 @@ def test_acceptance_challenge_is_fresh_and_recorded_before_callback_returns(tmp_
     assert decision.decision == "accept"
     assert calls == 2
     assert len(set(console.read_deadlines)) == 1
-    assert reviewer.callback_returned_record_ids == [reviewer.review_records[0].record_id]
+    assert reviewer.final_freshness_completed_record_ids == [reviewer.review_records[0].record_id]
+    assert reviewer.decision_record_published_ids == [reviewer.review_records[0].record_id]
     record = json.loads(reviewer.review_records[0].path.read_text(encoding="utf-8"))
     assert record["human_decision"]["rationale"] == "criteria verified"
     assert record["human_decision"]["controller_callback_return_pending_final_freshness"] is True
@@ -156,7 +159,7 @@ def test_review_entry_freshness_mismatch_publishes_nondecision(tmp_path, monkeyp
     record = json.loads(reviewer.review_records[0].path.read_text(encoding="utf-8"))
     assert record["human_decision"] is None
     assert record["evidence_provenance"]["freshness"]["differences"]
-    assert reviewer.callback_returned_record_ids == []
+    assert reviewer.final_freshness_completed_record_ids == []
 
 
 def test_final_freshness_runs_after_decision_publication_and_aborts_return(tmp_path, monkeypatch):
@@ -167,8 +170,9 @@ def test_final_freshness_runs_after_decision_publication_and_aborts_return(tmp_p
     reviewer = make_reviewer(tmp_path, console)
     calls = 0
 
-    def fresh(*, repo, baseline):
+    def fresh(*, repo, baseline, inspect_index_flags):
         nonlocal calls
+        assert inspect_index_flags is True
         calls += 1
         return fixture[6] if calls == 1 else fixture[6].model_copy(update={"final_head": "2" * 40})
 
@@ -178,7 +182,7 @@ def test_final_freshness_runs_after_decision_publication_and_aborts_return(tmp_p
 
     assert caught.value.stage == "final-before-controller-return"
     assert len(reviewer.review_records) == 1
-    assert reviewer.callback_returned_record_ids == []
+    assert reviewer.final_freshness_completed_record_ids == []
     record = json.loads(reviewer.review_records[0].path.read_text(encoding="utf-8"))
     assert record["human_decision"]["requested_action"] == "accept"
 

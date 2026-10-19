@@ -333,3 +333,120 @@ def test_index_fingerprint_fails_closed_on_incomplete_raw_observation(
 
     assert caught.value.git_failure.stage == "cumulative-index-entries"
     assert caught.value.git_failure.reason in {"output-budget-exceeded", "incomplete-collection"}
+
+
+def test_ordinary_run_preserves_non_utf8_patch_compatibility_and_verifies(tmp_path: Path) -> None:
+    import sys
+
+    from coding_agent_harness.models import TaskPacket, VerificationCommand, WorkerResult
+    from coding_agent_harness.orchestrator import run_task
+    from coding_agent_harness.process import ProcessResult
+    from coding_agent_harness.worker import WorkerRunResult
+
+    repo = make_repo(tmp_path)
+    marker = tmp_path / "verification-ran.txt"
+
+    class Latin1Worker:
+        def run(self, *, task, repo_dir):
+            (repo_dir / "existing.txt").write_bytes(b"caf\xe9\n")
+            return WorkerRunResult(
+                process=ProcessResult(
+                    argv=["synthetic"], exit_code=0, stdout="", stderr="",
+                    timed_out=False, elapsed_seconds=0.01,
+                ),
+                completion=WorkerResult(status="completed", summary="updated bytes", changed_files=["existing.txt"]),
+            )
+
+    result = run_task(
+        task=TaskPacket(
+            task_id="latin1", goal="write legacy bytes", acceptance=["verification ran"],
+            allowed_files=["existing.txt"],
+        ),
+        repo_dir=repo,
+        worker=Latin1Worker(),
+        verification_commands=[VerificationCommand(
+            id="marker", argv=[sys.executable, "-c", f"from pathlib import Path; Path({str(marker)!r}).write_text('ran')"],
+        )],
+    )
+
+    assert result.status == "ready-for-review"
+    assert result.verification.passed is True
+    assert marker.read_text(encoding="utf-8") == "ran"
+
+
+def test_raw_patch_digest_distinguishes_non_utf8_patches_with_same_display(tmp_path: Path) -> None:
+    from coding_agent_harness.human_review import _evidence_differences
+
+    repo = make_repo(tmp_path)
+    baseline = capture_baseline(repo)
+    (repo / "existing.txt").write_bytes(b"caf\xe9\n")
+    first = capture_evidence(repo=repo, baseline=baseline)
+    (repo / "existing.txt").write_bytes(b"caf\xff\n")
+    second = capture_evidence(repo=repo, baseline=baseline)
+
+    visible_lines = lambda patch: "\n".join(
+        line for line in patch.splitlines() if not line.startswith("index ")
+    )
+    assert visible_lines(first.patch) == visible_lines(second.patch)
+    assert first.patch_sha256 != second.patch_sha256
+    same_display_first = first.model_copy(update={"patch": "sanitized\n"})
+    same_display_second = second.model_copy(update={"patch": "sanitized\n"})
+    assert "patch_sha256" in _evidence_differences(same_display_first, same_display_second)
+
+
+@pytest.mark.parametrize("flag", ["--assume-unchanged", "--skip-worktree", "--both"])
+def test_control_index_flag_observation_uses_nul_delimited_paths(tmp_path: Path, flag: str) -> None:
+    from coding_agent_harness.git import assert_supported_index_flags
+
+    repo = make_repo(tmp_path)
+    unusual_name = "é spaces [name].txt"
+    (repo / unusual_name).write_text("baseline\n", encoding="utf-8")
+    git(repo, "add", "--", unusual_name)
+    git(repo, "commit", "-m", "add unusual path")
+
+    observation = assert_supported_index_flags(repo)
+    assert observation.entry_count == 2
+    assert observation.unsupported_entry_count == 0
+
+    selected_flag = "--assume-unchanged" if flag == "--both" else flag
+    git(repo, "update-index", selected_flag, "--", unusual_name)
+    if flag == "--both":
+        git(repo, "update-index", "--skip-worktree", "--", unusual_name)
+    with pytest.raises(Exception, match="unsupported-index-flags"):
+        assert_supported_index_flags(repo)
+
+
+@pytest.mark.parametrize("failure", ["truncated", "missing-raw-bytes", "malformed"])
+@pytest.mark.parametrize("phase", ["admission", "cumulative"])
+def test_control_index_flag_observation_fails_closed_when_incomplete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str, phase: str,
+) -> None:
+    import coding_agent_harness.git as git_module
+    import coding_agent_harness.process as process_module
+    from coding_agent_harness.git import GitCollectionError
+    from coding_agent_harness.process import ProcessResult
+
+    repo = make_repo(tmp_path)
+    baseline = capture_baseline(repo) if phase == "cumulative" else None
+    original = process_module.run_process
+
+    def observe(**kwargs):
+        if kwargs["argv"][1:] == ["ls-files", "-v", "-z"]:
+            output = b"invalid" if failure == "malformed" else b"H existing.txt\0"
+            return ProcessResult(
+                argv=kwargs["argv"], exit_code=0, stdout="", stderr="",
+                timed_out=False, elapsed_seconds=0.01,
+                stdout_truncated=failure == "truncated",
+                raw_stdout_bytes=(None if failure == "missing-raw-bytes" else output),
+            )
+        return original(**kwargs)
+
+    monkeypatch.setattr(git_module, "run_process", observe)
+    with pytest.raises(GitCollectionError) as caught:
+        if phase == "admission":
+            git_module.assert_supported_index_flags(repo)
+        else:
+            capture_evidence(repo=repo, baseline=baseline, inspect_index_flags=True)
+    assert caught.value.stage == (
+        "baseline-index-flags" if phase == "admission" else "cumulative-index-flags"
+    )

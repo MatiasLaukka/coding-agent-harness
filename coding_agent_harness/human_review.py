@@ -68,7 +68,8 @@ def _evidence_digest(evidence: GitEvidence) -> str:
 def _evidence_differences(expected: GitEvidence, observed: GitEvidence) -> list[str]:
     fields = (
         "baseline_commit", "final_head", "final_status", "changed_files",
-        "patch", "commits", "index_fingerprint",
+        "patch", "patch_sha256", "commits", "index_fingerprint",
+        "index_flags_fingerprint", "unsupported_index_flag_count",
     )
     return [name for name in fields if getattr(expected, name) != getattr(observed, name)]
 
@@ -241,7 +242,8 @@ class HumanReviewer:
         self.challenge_factory = challenge_factory or (lambda: secrets.token_hex(4).upper())
         self.clock = clock
         self.review_records: list[RecordReference] = []
-        self.callback_returned_record_ids: list[str] = []
+        self.decision_record_published_ids: list[str] = []
+        self.final_freshness_completed_record_ids: list[str] = []
 
     def _deadline(self) -> float:
         now = self.clock()
@@ -255,12 +257,25 @@ class HumanReviewer:
             raise ConsoleDeadlineExpired("review deadline expired")
 
     def _fresh_observation(self, *, expected: GitEvidence, stage: str) -> GitEvidence:
-        observed = capture_evidence(repo=self.repo_dir, baseline=self.baseline)
+        observed = capture_evidence(
+            repo=self.repo_dir, baseline=self.baseline, inspect_index_flags=True,
+        )
         expected_digest = _evidence_digest(expected)
         observed_digest = _evidence_digest(observed)
         differences = _evidence_differences(expected, observed)
         if expected.index_fingerprint is None or observed.index_fingerprint is None:
             differences = sorted(set(differences + ["index_fingerprint_unavailable"]))
+        if expected.patch_sha256 is None or observed.patch_sha256 is None:
+            differences = sorted(set(differences + ["patch_fingerprint_unavailable"]))
+        if (
+            expected.index_flags_fingerprint is None
+            or observed.index_flags_fingerprint is None
+            or expected.unsupported_index_flag_count is None
+            or observed.unsupported_index_flag_count is None
+        ):
+            differences = sorted(set(differences + ["index_flag_observation_unavailable"]))
+        if observed.unsupported_index_flag_count:
+            differences = sorted(set(differences + ["unsupported_index_flags_present"]))
         if differences:
             raise EvidenceFreshnessError(
                 stage=stage, differences=differences, expected_sha256=expected_digest,
@@ -490,11 +505,12 @@ class HumanReviewer:
         }
         reference = publish_record(self.record_directory, kind="review", record=record)
         self.review_records.append(reference)
+        self.decision_record_published_ids.append(reference.record_id)
 
         # Publication precedes this final bounded collection. Any discrepancy
         # aborts the callback; the saved human request is never a resume token.
         self._check_deadline(deadline)
         final = self._fresh_observation(expected=evidence, stage="final-before-controller-return")
         self._check_deadline(deadline)
-        self.callback_returned_record_ids.append(reference.record_id)
+        self.final_freshness_completed_record_ids.append(reference.record_id)
         return decision

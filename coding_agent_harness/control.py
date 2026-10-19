@@ -23,7 +23,7 @@ from .control_records import (
     prepare_record_directory,
     publish_record,
 )
-from .git import GitBaseline, capture_baseline
+from .git import GitBaseline, assert_supported_index_flags, capture_baseline
 from .human_review import HumanReviewer, _terminal_json, render_start_authorization
 from .models import StrictModel, TaskPacket, VerificationCommand
 from .worker import QwenWorker
@@ -240,9 +240,22 @@ def _invocation_observation(state: _WorkflowState) -> dict[str, Any]:
 def _review_references(state: _WorkflowState) -> list[dict[str, Any]]:
     if state.reviewer is None:
         return []
-    returned = set(state.reviewer.callback_returned_record_ids)
+    published_decisions = set(state.reviewer.decision_record_published_ids)
+    final_freshness = set(state.reviewer.final_freshness_completed_record_ids)
     return [
-        {**reference.model_dump(), "controller_callback_returned": reference.record_id in returned}
+        {
+            **reference.model_dump(),
+            "decision_record_published": reference.record_id in published_decisions,
+            "final_freshness_validation_completed": reference.record_id in final_freshness,
+            "controller_decision_receipt": (
+                "observed" if state.result is not None and reference.record_id in published_decisions
+                else "unknown" if reference.record_id in published_decisions
+                else "not-applicable"
+            ),
+            "controller_decision_processed": (
+                state.result is not None and reference.record_id in published_decisions
+            ),
+        }
         for reference in state.reviewer.review_records
     ]
 
@@ -460,6 +473,7 @@ def run_control(
             state.console = console
             try:
                 state.stage = "approved-baseline"
+                assert_supported_index_flags(repo_dir)
                 baseline = capture_baseline(repo_dir)
                 state.baseline = baseline
 
@@ -540,6 +554,7 @@ def run_control(
                 controller = controller_factory(
                     worker=worker, reviewer=state.reviewer,
                     max_remediation_attempts=budget, stdin_devnull=True,
+                    reject_unsupported_index_flags=True,
                 )
                 state.stage = "controller"
                 state.controller_called = True
