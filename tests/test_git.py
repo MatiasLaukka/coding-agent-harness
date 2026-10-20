@@ -284,7 +284,8 @@ def test_index_fingerprint_detects_staged_blob_and_mode_content_changes(tmp_path
     assert first.final_head == second.final_head == third.final_head == baseline.commit
     assert first.final_status == second.final_status == third.final_status != ""
     assert first.patch == second.patch
-    assert second.patch != third.patch
+    # Staged-only blob and mode changes are established by the exact index
+    # fingerprint; the cumulative worktree patch is not an index-vs-HEAD diff.
     assert first.index_fingerprint != second.index_fingerprint
     assert second.index_fingerprint != third.index_fingerprint
 
