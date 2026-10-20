@@ -6,11 +6,14 @@ from typing import Literal, Sequence
 from pydantic import Field
 
 from coding_agent_harness.git import (
+    GitBaseline,
     GitFailureMetadata,
     capture_attempt_evidence,
     capture_baseline,
     capture_evidence,
     capture_worktree_snapshot,
+    assert_supported_index_flags,
+    require_supported_index_flags,
 )
 from coding_agent_harness.models import (
     ReviewDecision,
@@ -100,14 +103,22 @@ class HarnessController:
         worker,
         reviewer,
         max_remediation_attempts: int = 2,
+        stdin_devnull: bool = False,
+        reject_unsupported_index_flags: bool = False,
     ):
         if type(max_remediation_attempts) is not int or max_remediation_attempts < 0:
             raise ValueError(
                 "max_remediation_attempts must be a nonnegative integer"
             )
 
+        if type(stdin_devnull) is not bool:
+            raise ValueError("stdin_devnull must be a boolean")
+        if type(reject_unsupported_index_flags) is not bool:
+            raise ValueError("reject_unsupported_index_flags must be a boolean")
         self.worker = worker
         self.reviewer = reviewer
+        self.stdin_devnull = stdin_devnull
+        self.reject_unsupported_index_flags = reject_unsupported_index_flags
         self.max_remediation_attempts = (
             max_remediation_attempts
         )
@@ -120,11 +131,13 @@ class HarnessController:
         verification_commands: Sequence[
             VerificationCommand
         ],
+        expected_baseline: GitBaseline | None = None,
     ) -> HarnessRunResult:
         context = {"attempts": [], "stage": "baseline", "worker_invocation_count": 0}
         try:
             return self._run(task=task, repo_dir=repo_dir,
-                             verification_commands=verification_commands, context=context)
+                             verification_commands=verification_commands,
+                             expected_baseline=expected_baseline, context=context)
         except BaseException as exc:
             context["failure_type"] = type(exc).__name__
             if context["attempts"]:
@@ -143,9 +156,17 @@ class HarnessController:
             exc.harness_evidence = context
             raise
 
-    def _run(self, *, task, repo_dir, verification_commands, context) -> HarnessRunResult:
+    def _run(self, *, task, repo_dir, verification_commands, expected_baseline, context) -> HarnessRunResult:
         baseline = capture_baseline(repo_dir)
         context["baseline"] = baseline
+        if expected_baseline is not None:
+            approved = GitBaseline.model_validate(
+                expected_baseline.model_dump(mode="python", warnings=False), strict=True,
+            )
+            if baseline.commit != approved.commit or baseline.status != approved.status:
+                raise ValueError("controller baseline differs from the approved baseline")
+        if self.reject_unsupported_index_flags:
+            assert_supported_index_flags(repo_dir)
 
         original_task = task
         current_task = task
@@ -181,12 +202,14 @@ class HarnessController:
 
             record["worker_assessment"] = worker_assessment
             context["stage"] = "git-evidence"
-            evidence = capture_evidence(
-                repo=repo_dir,
-                baseline=baseline,
-            )
+            capture_options = {"repo": repo_dir, "baseline": baseline}
+            if self.reject_unsupported_index_flags:
+                capture_options["inspect_index_flags"] = True
+            evidence = capture_evidence(**capture_options)
 
             record["git_evidence"] = evidence
+            if self.reject_unsupported_index_flags:
+                require_supported_index_flags(evidence)
             context["stage"] = "attempt-evidence"
             attempt_evidence = capture_attempt_evidence(
                 repo=repo_dir,
@@ -279,10 +302,13 @@ class HarnessController:
                     )
 
             context["stage"] = "verification"
-            verification = run_verification(
-                repo_dir=repo_dir,
-                commands=verification_commands,
-            )
+            verification_kwargs = {
+                "repo_dir": repo_dir,
+                "commands": verification_commands,
+            }
+            if self.stdin_devnull:
+                verification_kwargs["stdin_devnull"] = True
+            verification = run_verification(**verification_kwargs)
 
             record["verification"] = verification
             context["stage"] = "verification-assessment"

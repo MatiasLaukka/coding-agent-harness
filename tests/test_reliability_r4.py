@@ -346,6 +346,8 @@ def _fake_process_result(argv, **overrides) -> ProcessResult:
         surviving_pids=[],
     )
     values.update(overrides)
+    if values.get("raw_stdout_bytes") is None and not values.get("stdout_truncated"):
+        values["raw_stdout_bytes"] = values["stdout"].encode("utf-8", errors="strict")
     return ProcessResult(**values)
 
 
@@ -1340,12 +1342,17 @@ def test_cumulative_collection_commands_share_one_deadline(
 
     assert evidence.changed_files == []
     assert evidence.patch == ""
-    assert len(calls) == 7
+    assert evidence.index_fingerprint is not None
+    assert len(calls) == 8
     assert len({call["deadline"] for call in calls}) == 1
     assert all(call["stdout_limit_bytes"] == git_module.GIT_STDOUT_LIMIT_BYTES
-               for call in calls if call["argv"][1:] != ["diff", "--binary", "--no-ext-diff",
-                                                        "--no-textconv", baseline.commit, "--"])
+               for call in calls if call["argv"][1:] not in (
+                   ["diff", "--binary", "--no-ext-diff", "--no-textconv", baseline.commit, "--"],
+                   ["ls-files", "--stage", "-z"],
+               ))
     assert any(call["stdout_limit_bytes"] == git_module.GIT_PATCH_STDOUT_LIMIT_BYTES
+               for call in calls)
+    assert any(call["stdout_limit_bytes"] == git_module.GIT_INDEX_STDOUT_LIMIT_BYTES
                for call in calls)
 
 

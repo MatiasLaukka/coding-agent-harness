@@ -201,6 +201,25 @@ and cleanup return successfully. A crash can leave a temporary file. This is not
 a crash-durable archive: directory metadata is not fsynced. The feature adds no
 approval, remediation, resume, controller-history, or supervisor workflow.
 
+### Human-reviewed controller CLI
+
+`coding-harness control` runs the existing `HarnessController` in the foreground with a bounded Windows console reviewer:
+
+```powershell
+coding-harness control task.json --repo D:\work\target-worktree --model YOUR_CONFIGURED_QWEN_MODEL --record-dir D:\work\harness-records
+```
+
+The task file uses the task and verification-command shape above. This command requires an explicit nonempty `allowed_files` list and at least one non-advisory verification check. Check IDs must be unique. Task text, paths, arguments, check counts, and timeouts have finite bounds. `--max-remediation-attempts` accepts only `0` or `1` (default `0`); `--review-timeout` accepts 1–1,800 seconds (default 300). The process uses `DEVNULL` for worker and verification stdin. A genuine Windows console input handle and console output screen buffer are required before authorization or worker dispatch.
+
+Before dispatch, the CLI displays the validated task, exact checks and commands, model, worker command and exact first-dispatch argv, timeout, file scope, budget, canonical worktree and Git metadata roots, and a clean baseline. The operator types a fresh `START <challenge>`. This authorizes exactly the first dispatch under that configuration. A start record must publish successfully before the controller is called. The controller independently captures its baseline and rejects a mismatch with the displayed baseline before invoking the worker.
+
+After each worker attempt and verification, the reviewer sees the worker claim and process status, independent cumulative Git evidence and full captured patch, changed paths and scope observation, verification outcomes and infrastructure flags, the attempt and remaining remediation budget, and an explicit statement that acceptance has not occurred. Cumulative changes are evidence from the approved baseline; they are not presented as per-attempt deltas. The operator can enter `ACCEPT <challenge>`, `STOP`, or, when budget remains, `REMEDIATE <challenge>`. Acceptance and remediation require a bounded nonblank rationale; remediation also requires bounded instructions. Each action uses one challenge confirmation. The controller remains responsible for acceptance gates and may reject a human acceptance request. The initial START does not authorize acceptance or remediation.
+
+The controller captures a bounded Git observation immediately after the worker and before verification. It includes a SHA-256 fingerprint over the exact bytes from `git ls-files --stage -z`, including staged paths, modes, object IDs, and stages; incidental index-file timestamps are not part of the fingerprint. At review entry, the CLI recollects Git-visible state against the same baseline and fails closed if it differs, including changes caused by verification. After publishing a human decision record, it makes one final bounded freshness check before returning that decision to the controller. It does not update the packet, rerun verification, or retry the worker after a freshness failure. These checks compare point-in-time observations; a concurrent change can still occur after the final check or between operations. OS filesystem calls may block, so the workflow does not claim a universal hard wall-clock bound.
+
+`--record-dir` must name an existing trusted directory dedicated to records and outside the repository and its Git metadata. The CLI publishes create-only `start-<uuid>.json`, `review-<uuid>.json`, and `terminal-<uuid>.json` records, linked by workflow and record identifiers and digests. Start publication precedes dispatch; decision-bearing review publication precedes the controller callback return; a terminal record captures the actual controller result or available failure evidence. A missing terminal record means the workflow is incomplete. Records can contain sensitive, unredacted tasks, commands, source, diffs, and output. They are not tamper-proof, authenticated, or crash-durable, and must not be treated as authorization or resume checkpoints. The operator must keep this directory independent of all operational resources throughout publication; being outside the worktree alone does not certify independence.
+
+Exit codes are `0` for controller acceptance with terminal publication, `2` for a completed nonaccepted outcome with terminal publication, `1` for workflow/evidence/input/publication errors, and `130` for Ctrl+C. If terminal publication fails after the controller returns, the CLI reports that failure while preserving the actual outcome in available native evidence; it does not invent a different controller decision. No push, pull request, or merge is performed.
 ### Controller integration
 
 For reviewer-driven runs, use `HarnessController(worker=..., reviewer=..., max_remediation_attempts=2)` and call `run(task=..., repo_dir=..., verification_commands=...)`. Supply a worker implementing `run(*, task, repo_dir)` and a reviewer implementing:
@@ -209,7 +228,7 @@ For reviewer-driven runs, use `HarnessController(worker=..., reviewer=..., max_r
 review(*, task, worker_result, worker_assessment, evidence, verification, attempt)
 ```
 
-The reviewer must return a validated `ReviewDecision`. The controller revalidates it before branching; malformed decisions raise without authorizing another worker invocation. Remediation budgets must be nonnegative integers; booleans and nonfinite or fractional values are rejected. `QwenWorker` is the provided worker adapter. Integration with a human review UI or hosted model is left to the caller. The returned `HarnessRunResult` contains status, attempt count, and audit events; evidence is passed to the reviewer rather than persisted automatically.
+The reviewer must return a validated `ReviewDecision`. The controller revalidates it before branching; malformed decisions raise without authorizing another worker invocation. Remediation budgets must be nonnegative integers; booleans and nonfinite or fractional values are rejected. `QwenWorker` is the provided worker adapter. The `control` command is the provided human review surface; no hosted reviewer integration is included. The returned `HarnessRunResult` contains status, attempt count, and audit events; evidence is passed to the reviewer rather than persisted automatically.
 
 ## Offline supervisor handoff
 

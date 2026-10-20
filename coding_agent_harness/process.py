@@ -37,6 +37,7 @@ class ProcessResult(StrictModel):
     cleanup_attempted: bool = False
     cleanup_errors: list[str] = Field(default_factory=list)
     surviving_pids: list[int] = Field(default_factory=list)
+    raw_stdout_bytes: bytes | None = Field(default=None, exclude=True, repr=False)
 
     @property
     def infrastructure_failed(self) -> bool:
@@ -177,6 +178,10 @@ class _Capture:
         with self.lock:
             return bytes(self.data).decode('utf-8', errors='replace')
 
+    def snapshot_bytes(self) -> bytes:
+        with self.lock:
+            return bytes(self.data)
+
 
 def run_process(
     *,
@@ -187,6 +192,8 @@ def run_process(
     stdout_limit_bytes: int = OUTPUT_LIMIT_BYTES,
     stderr_limit_bytes: int = OUTPUT_LIMIT_BYTES,
     deadline: float | None = None,
+    stdin_devnull: bool = False,
+    capture_stdout_bytes: bool = False,
 ) -> ProcessResult:
     if not argv:
         raise ValueError('argv must not be empty')
@@ -202,6 +209,8 @@ def run_process(
     ):
         if type(limit) is not int or limit <= 0:
             raise ValueError(f'{name} must be a positive integer')
+    if type(stdin_devnull) is not bool or type(capture_stdout_bytes) is not bool:
+        raise ValueError('stdin_devnull and capture_stdout_bytes must be booleans')
     if deadline is not None and (
         type(deadline) not in (int, float) or not math.isfinite(deadline) or deadline <= 0
     ):
@@ -227,19 +236,22 @@ def run_process(
             elapsed_seconds=max(0.0, time.monotonic() - started),
             started=False,
             output_complete=False,
+            raw_stdout_bytes=b'' if capture_stdout_bytes else None,
         )
     try:
         process = subprocess.Popen(
             command,
             cwd=cwd,
             env=env,
+            stdin=subprocess.DEVNULL if stdin_devnull else None,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
     except OSError as exc:
         return ProcessResult(argv=command, exit_code=None, stdout='', stderr='',
                              timed_out=False, elapsed_seconds=time.monotonic() - started,
-                             started=False, failure_type=type(exc).__name__, output_complete=False)
+                             started=False, failure_type=type(exc).__name__, output_complete=False,
+                             raw_stdout_bytes=b'' if capture_stdout_bytes else None)
 
     timed_out = False
     failure: BaseException | None = None
@@ -317,6 +329,7 @@ def run_process(
         output_complete=all(c.eof and c.done.is_set() and not c.error for c in (stdout_capture, stderr_capture)),
         stdout_truncated=stdout_capture.truncated, stderr_truncated=stderr_capture.truncated,
         cleanup_attempted=cleanup_attempted, cleanup_errors=cleanup.errors, surviving_pids=cleanup.surviving_pids,
+        raw_stdout_bytes=stdout_capture.snapshot_bytes() if capture_stdout_bytes else None,
     )
     if failure:
         # Preserve cancellation/exception identity and partial execution evidence.

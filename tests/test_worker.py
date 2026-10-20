@@ -295,3 +295,26 @@ def test_render_task_prompt_stops_tools_and_preserves_completion_schema() -> Non
     for field in ('summary', 'changed_files', 'remaining_concerns'):
         assert f'"{field}"' in prompt
     assert "modified during this worker invocation only." in prompt
+
+
+def test_worker_opt_in_passes_devnull_to_common_runner(tmp_path, monkeypatch):
+    import coding_agent_harness.worker as worker_module
+    from coding_agent_harness.models import TaskPacket
+    from coding_agent_harness.process import ProcessResult
+    from coding_agent_harness.worker import QwenWorker
+
+    captured = {}
+    def fake_run_process(**kwargs):
+        captured.update(kwargs)
+        return ProcessResult(
+            argv=kwargs["argv"], exit_code=0,
+            stdout='HARNESS_RESULT: {"status":"completed","summary":"ok"}',
+            stderr="", timed_out=False, elapsed_seconds=0.01,
+        )
+    monkeypatch.setattr(worker_module, "run_process", fake_run_process)
+    worker = QwenWorker(command=["offline"], model="offline-model", timeout_seconds=5, stdin_devnull=True)
+    task = TaskPacket(task_id="task", goal="do work", acceptance=["check"])
+
+    worker.run(task=task, repo_dir=tmp_path)
+
+    assert captured["stdin_devnull"] is True

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import math
 import os
 import re
@@ -28,6 +29,7 @@ ATTEMPT_EVIDENCE_TIMEOUT_SECONDS = 30
 # Per-command capture limits. The patch remains textual Git --binary output.
 GIT_STDOUT_LIMIT_BYTES = 1024 * 1024
 GIT_PATCH_STDOUT_LIMIT_BYTES = 8 * 1024 * 1024
+GIT_INDEX_STDOUT_LIMIT_BYTES = 4 * 1024 * 1024
 GIT_STDERR_LIMIT_BYTES = 64 * 1024
 
 _INDEX_COPY_CHUNK_BYTES = 64 * 1024
@@ -42,12 +44,14 @@ _GIT_FAILURE_REASONS = frozenset({
     "cleanup-failed",
     "termination-unconfirmed",
     "baseline-not-clean",
+    "unsupported-index-flags",
 })
 
 _GIT_FAILURE_STAGES = frozenset({
     "baseline-head",
     "baseline-status",
     "baseline-cleanliness",
+    "baseline-index-flags",
     "snapshot-index-init",
     "snapshot-read-tree",
     "snapshot-add",
@@ -64,6 +68,8 @@ _GIT_FAILURE_STAGES = frozenset({
     "cumulative-patch-index-cleanup",
     "cumulative-patch",
     "cumulative-commits",
+    "cumulative-index-entries",
+    "cumulative-index-flags",
     "attempt-after-snapshot-index-init",
     "attempt-after-snapshot-read-tree",
     "attempt-after-snapshot-add",
@@ -123,6 +129,17 @@ class GitEvidence(StrictModel):
     changed_files: list[str]
     patch: str
     commits: list[str]
+    index_fingerprint: str | None = None
+    patch_sha256: str | None = None
+    index_flags_fingerprint: str | None = None
+    unsupported_index_flag_count: int | None = None
+
+
+@dataclass(frozen=True)
+class IndexFlagObservation:
+    fingerprint: str
+    entry_count: int
+    unsupported_entry_count: int
 
 
 class GitWorktreeSnapshot(StrictModel):
@@ -472,7 +489,9 @@ def _git(
     env: dict[str, str] | None = None,
     stdout_limit_bytes: int = GIT_STDOUT_LIMIT_BYTES,
     temporary_index: _TemporaryIndex | None = None,
-) -> str:
+    raw_output: bool = False,
+    strict_text: bool = False,
+) -> str | bytes:
     remaining = _remaining(deadline, stage)
     if temporary_index is not None:
         temporary_index.process_may_be_active = True
@@ -486,6 +505,7 @@ def _git(
             deadline=deadline,
             stdout_limit_bytes=stdout_limit_bytes,
             stderr_limit_bytes=GIT_STDERR_LIMIT_BYTES,
+            capture_stdout_bytes=True,
         )
     except BaseException as exc:
         process_result = getattr(exc, "process_result", None)
@@ -530,7 +550,96 @@ def _git(
             process_result=result,
             stdout_limit_bytes=stdout_limit_bytes,
         )
+    if raw_output:
+        if not isinstance(result.raw_stdout_bytes, bytes):
+            _raise_git_failure(
+                "incomplete-collection", stage,
+                stdout_limit_bytes=stdout_limit_bytes,
+            )
+        return result.raw_stdout_bytes
+    if strict_text:
+        if not isinstance(result.raw_stdout_bytes, bytes):
+            _raise_git_failure("incomplete-collection", stage, stdout_limit_bytes=stdout_limit_bytes)
+        try:
+            return result.raw_stdout_bytes.decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            _raise_git_failure("incomplete-collection", stage, stdout_limit_bytes=stdout_limit_bytes)
+    # Preserve the process runner's established replacement-decoded text for
+    # legacy callers. Control freshness separately fingerprints raw patch bytes.
     return result.stdout
+
+def _capture_index_fingerprint(*, repo: Path, deadline: float) -> str:
+    output = _git(
+        repo,
+        "ls-files",
+        "--stage",
+        "-z",
+        deadline=deadline,
+        stage="cumulative-index-entries",
+        stdout_limit_bytes=GIT_INDEX_STDOUT_LIMIT_BYTES,
+        raw_output=True,
+    )
+    if not isinstance(output, bytes):
+        _raise_git_failure(
+            "incomplete-collection", "cumulative-index-entries",
+            stdout_limit_bytes=GIT_INDEX_STDOUT_LIMIT_BYTES,
+        )
+    return hashlib.sha256(b"harness-index-entries-v1\0" + output).hexdigest()
+
+
+def _parse_index_flag_observation(output: bytes, *, stage: str) -> IndexFlagObservation:
+    if output and not output.endswith(b"\0"):
+        _raise_git_failure("incomplete-collection", stage, stdout_limit_bytes=GIT_INDEX_STDOUT_LIMIT_BYTES)
+    records = output[:-1].split(b"\0") if output else []
+    unsupported = 0
+    valid_tags = frozenset(b"HSMRCK?")
+    for record in records:
+        if len(record) < 3 or record[1] != 0x20 or not record[2:]:
+            _raise_git_failure("incomplete-collection", stage, stdout_limit_bytes=GIT_INDEX_STDOUT_LIMIT_BYTES)
+        tag = record[0]
+        upper_tag = bytes((tag,)).upper()[0]
+        if upper_tag not in valid_tags:
+            _raise_git_failure("incomplete-collection", stage, stdout_limit_bytes=GIT_INDEX_STDOUT_LIMIT_BYTES)
+        # `ls-files -v` lowercases the status tag for assume-unchanged;
+        # `S` marks skip-worktree. Lowercase `s` therefore captures both.
+        if tag != upper_tag or upper_tag == ord("S"):
+            unsupported += 1
+    return IndexFlagObservation(
+        fingerprint=hashlib.sha256(b"harness-index-flags-v1\0" + output).hexdigest(),
+        entry_count=len(records),
+        unsupported_entry_count=unsupported,
+    )
+
+
+def _capture_index_flags(
+    *, repo: Path, deadline: float, stage: str,
+) -> IndexFlagObservation:
+    output = _git(
+        repo, "ls-files", "-v", "-z", deadline=deadline, stage=stage,
+        stdout_limit_bytes=GIT_INDEX_STDOUT_LIMIT_BYTES, raw_output=True,
+    )
+    if not isinstance(output, bytes):
+        _raise_git_failure("incomplete-collection", stage, stdout_limit_bytes=GIT_INDEX_STDOUT_LIMIT_BYTES)
+    return _parse_index_flag_observation(output, stage=stage)
+
+
+def assert_supported_index_flags(repo: Path) -> IndexFlagObservation:
+    """Require a complete, bounded observation with no assume/skip-worktree tags."""
+    stage = "baseline-index-flags"
+    deadline = _new_deadline(BASELINE_TIMEOUT_SECONDS)
+    observation = _capture_index_flags(repo=repo, deadline=deadline, stage=stage)
+    _remaining(deadline, stage)
+    if observation.unsupported_entry_count:
+        _raise_git_failure("unsupported-index-flags", stage, stdout_limit_bytes=GIT_INDEX_STDOUT_LIMIT_BYTES)
+    return observation
+
+
+def require_supported_index_flags(evidence: GitEvidence, *, stage: str = "cumulative-index-flags") -> None:
+    if evidence.index_flags_fingerprint is None or evidence.unsupported_index_flag_count is None:
+        _raise_git_failure("incomplete-collection", stage, stdout_limit_bytes=GIT_INDEX_STDOUT_LIMIT_BYTES)
+    if evidence.unsupported_index_flag_count:
+        _raise_git_failure("unsupported-index-flags", stage, stdout_limit_bytes=GIT_INDEX_STDOUT_LIMIT_BYTES)
+
 
 def _require_object_id(output: str, stage: str) -> str:
     value = output.strip()
@@ -539,7 +648,7 @@ def _require_object_id(output: str, stage: str) -> str:
     return value
 
 
-def _status(repo: Path, *, deadline: float, stage: str) -> str:
+def _status(repo: Path, *, deadline: float, stage: str, strict_text: bool = False) -> str:
     return _git(
         repo,
         "status",
@@ -547,6 +656,7 @@ def _status(repo: Path, *, deadline: float, stage: str) -> str:
         "--untracked-files=all",
         deadline=deadline,
         stage=stage,
+        strict_text=strict_text,
     ).rstrip("\r\n")
 
 
@@ -555,8 +665,9 @@ def _git_z(
     *args: str,
     deadline: float,
     stage: str,
+    strict_text: bool = False,
 ) -> list[str]:
-    output = _git(repo, *args, deadline=deadline, stage=stage)
+    output = _git(repo, *args, deadline=deadline, stage=stage, strict_text=strict_text)
     if output and not output.endswith("\0"):
         _raise_git_failure("incomplete-collection", stage)
     paths = [item for item in output.split("\0") if item]
@@ -1017,7 +1128,8 @@ def _capture_patch_with_untracked(
     untracked_files: list[str],
     deadline: float,
     ownership: _GitCollectionOwnership,
-) -> str:
+    strict_text: bool = False,
+) -> tuple[str, str]:
     index_path_text = _git(
         repo,
         "rev-parse",
@@ -1025,6 +1137,7 @@ def _capture_patch_with_untracked(
         "index",
         deadline=deadline,
         stage="cumulative-patch-index-path",
+        strict_text=strict_text,
     ).strip()
     if not index_path_text:
         _raise_git_failure("incomplete-collection", "cumulative-patch-index-path")
@@ -1058,7 +1171,7 @@ def _capture_patch_with_untracked(
                 temporary_index=temporary_index,
             )
 
-        return _git(
+        patch_bytes = _git(
             repo,
             "diff",
             "--binary",
@@ -1071,9 +1184,25 @@ def _capture_patch_with_untracked(
             stage="cumulative-patch",
             stdout_limit_bytes=GIT_PATCH_STDOUT_LIMIT_BYTES,
             temporary_index=temporary_index,
+            raw_output=True,
         )
+        if not isinstance(patch_bytes, bytes):
+            _raise_git_failure(
+                "incomplete-collection", "cumulative-patch",
+                stdout_limit_bytes=GIT_PATCH_STDOUT_LIMIT_BYTES,
+            )
+        # Match ProcessResult.stdout's legacy UTF-8 replacement decoding while
+        # retaining an exact digest over the bounded original Git bytes.
+        patch = patch_bytes.decode("utf-8", errors="replace")
+        patch_sha256 = hashlib.sha256(b"harness-cumulative-patch-v1\0" + patch_bytes).hexdigest()
+        return patch, patch_sha256
 
-def capture_evidence(*, repo: Path, baseline: GitBaseline) -> GitEvidence:
+
+def capture_evidence(
+    *, repo: Path, baseline: GitBaseline, inspect_index_flags: bool = False,
+) -> GitEvidence:
+    if type(inspect_index_flags) is not bool:
+        raise ValueError("inspect_index_flags must be a boolean")
     partial = {"baseline_commit": baseline.commit}
     ownership = _GitCollectionOwnership()
     stage = "cumulative-head"
@@ -1081,13 +1210,16 @@ def capture_evidence(*, repo: Path, baseline: GitBaseline) -> GitEvidence:
         deadline = _new_deadline(CUMULATIVE_TIMEOUT_SECONDS)
 
         final_head = _require_object_id(
-            _git(repo, "rev-parse", "HEAD", deadline=deadline, stage=stage),
+            _git(
+                repo, "rev-parse", "HEAD", deadline=deadline, stage=stage,
+                strict_text=inspect_index_flags,
+            ),
             stage,
         )
         partial["final_head"] = final_head
 
         stage = "cumulative-status"
-        final_status = _status(repo, deadline=deadline, stage=stage)
+        final_status = _status(repo, deadline=deadline, stage=stage, strict_text=inspect_index_flags)
         partial["final_status"] = final_status
 
         stage = "cumulative-tracked-files"
@@ -1101,6 +1233,7 @@ def capture_evidence(*, repo: Path, baseline: GitBaseline) -> GitEvidence:
             "--",
             deadline=deadline,
             stage=stage,
+            strict_text=inspect_index_flags,
         )
         partial["tracked_changes"] = tracked_changes
 
@@ -1113,20 +1246,23 @@ def capture_evidence(*, repo: Path, baseline: GitBaseline) -> GitEvidence:
             "-z",
             deadline=deadline,
             stage=stage,
+            strict_text=inspect_index_flags,
         )
         changed_files = sorted(set(tracked_changes + untracked_files))
         partial["changed_files"] = changed_files
         _remaining(deadline, stage)
 
         stage = "cumulative-patch"
-        patch = _capture_patch_with_untracked(
+        patch, patch_sha256 = _capture_patch_with_untracked(
             repo=repo,
             baseline_commit=baseline.commit,
             untracked_files=untracked_files,
             deadline=deadline,
             ownership=ownership,
+            strict_text=inspect_index_flags,
         )
         partial["patch"] = patch
+        partial["patch_sha256"] = patch_sha256
 
         stage = "cumulative-commits"
         commits_output = _git(
@@ -1136,10 +1272,27 @@ def capture_evidence(*, repo: Path, baseline: GitBaseline) -> GitEvidence:
             f"{baseline.commit}..{final_head}",
             deadline=deadline,
             stage=stage,
+            strict_text=inspect_index_flags,
         )
         commits = [line for line in commits_output.splitlines() if line.strip()]
         _remaining(deadline, stage)
         partial["commits"] = commits
+
+        stage = "cumulative-index-entries"
+        index_fingerprint = _capture_index_fingerprint(repo=repo, deadline=deadline)
+        partial["index_fingerprint"] = index_fingerprint
+        _remaining(deadline, stage)
+
+        index_flags_fingerprint = None
+        unsupported_index_flag_count = None
+        if inspect_index_flags:
+            stage = "cumulative-index-flags"
+            flag_observation = _capture_index_flags(repo=repo, deadline=deadline, stage=stage)
+            index_flags_fingerprint = flag_observation.fingerprint
+            unsupported_index_flag_count = flag_observation.unsupported_entry_count
+            partial["index_flags_fingerprint"] = index_flags_fingerprint
+            partial["unsupported_index_flag_count"] = unsupported_index_flag_count
+            _remaining(deadline, stage)
 
         ownership.require_complete(stage)
         return GitEvidence(
@@ -1149,6 +1302,10 @@ def capture_evidence(*, repo: Path, baseline: GitBaseline) -> GitEvidence:
             changed_files=changed_files,
             patch=patch,
             commits=commits,
+            index_fingerprint=index_fingerprint,
+            patch_sha256=patch_sha256,
+            index_flags_fingerprint=index_flags_fingerprint,
+            unsupported_index_flag_count=unsupported_index_flag_count,
         )
     except BaseException as exc:
         _attach_unexpected_failure(exc, partial, stage, ownership)
