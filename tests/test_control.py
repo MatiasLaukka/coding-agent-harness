@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from coding_agent_harness import control, controller as controller_module
+from coding_agent_harness.console import ConsoleDeadlineExpired
 from coding_agent_harness.controller import HarnessRunResult
 from coding_agent_harness.git import GitBaseline
 from coding_agent_harness.models import TaskPacket, VerificationCommand, WorkerResult
@@ -168,6 +169,7 @@ def test_control_accepts_only_after_start_and_publishes_terminal(tmp_path):
     assert reference["final_freshness_validation_completed"] is True
     assert reference["controller_decision_receipt"] == "observed"
     assert reference["controller_decision_processed"] is True
+    assert reference["controller_decision_processing_basis"] == "controller run returned after processing the decision"
 
 
 def test_one_human_remediation_is_frozen_and_no_third_attempt_is_possible(tmp_path):
@@ -211,7 +213,91 @@ def test_one_human_remediation_is_frozen_and_no_third_attempt_is_possible(tmp_pa
     assert all(reference["final_freshness_validation_completed"] for reference in terminal["review_records"])
     assert all(reference["controller_decision_receipt"] == "observed" for reference in terminal["review_records"])
     assert all(reference["controller_decision_processed"] for reference in terminal["review_records"])
+    assert all(
+        reference["controller_decision_processing_basis"]
+        == "controller run returned after processing the decision"
+        for reference in terminal["review_records"]
+    )
     assert "No remediation attempt remains" in "".join(console.output)
+
+
+@pytest.mark.parametrize(
+    ("second_review_end", "expected_exit"),
+    [
+        pytest.param("timeout", 1, id="timeout"),
+        pytest.param("interrupt", 130, id="interrupt"),
+    ],
+)
+def test_prior_remediation_projection_uses_native_attempt_evidence(
+    tmp_path, second_review_end, expected_exit,
+):
+    repo, records = make_repo(tmp_path)
+    task_file = tmp_path / "task.json"
+    write_task(task_file)
+    end = (
+        ConsoleDeadlineExpired("second review deadline expired")
+        if second_review_end == "timeout"
+        else KeyboardInterrupt()
+    )
+    console = FakeConsole([
+        "START A1B2C3D4",
+        "REMEDIATE E5F6A7B8", "repair the requested behavior", "change only the existing file",
+        end,
+    ])
+    instances = []
+
+    status = control.run_control(
+        args_for(repo, records, task_file, budget=1), console_factory=lambda: console,
+        worker_factory=make_worker_factory(records, instances),
+        challenge_factory=codes("A1B2C3D4", "E5F6A7B8", "9ABCDEF0"),
+    )
+
+    terminal = json.loads(next(records.glob("terminal-*.json")).read_text(encoding="utf-8"))
+    native = terminal["native_evidence"]["harness_evidence"]
+    first = terminal["review_records"][0]
+    assert status == expected_exit
+    assert len(instances[0].calls) == 2
+    assert terminal["controller_result"] is None
+    assert native["attempts"][0]["decision"]["decision"] == "remediate"
+    assert native["attempts"][1]["attempt"] == 2
+    assert native["worker_invocation_count"] == 2
+    assert first["decision_record_published"] is True
+    assert first["controller_decision_receipt"] == "observed"
+    assert first["controller_decision_processed"] is True
+    assert first["controller_decision_processing_basis"] == "subsequent native controller attempt record"
+    second = terminal["review_records"][1]
+    assert second["decision_record_published"] is False
+    assert "decision" not in native["attempts"][1]
+    assert second["controller_decision_receipt"] == "not-applicable"
+    assert second["controller_decision_processed"] is None
+
+
+def test_second_review_stop_confirms_prior_remediation_processing(tmp_path):
+    repo, records = make_repo(tmp_path)
+    task_file = tmp_path / "task.json"
+    write_task(task_file)
+    console = FakeConsole([
+        "START A1B2C3D4",
+        "REMEDIATE E5F6A7B8", "repair the requested behavior", "change only the existing file",
+        "STOP", "stop after the authorized remediation",
+    ])
+    instances = []
+
+    status = control.run_control(
+        args_for(repo, records, task_file, budget=1), console_factory=lambda: console,
+        worker_factory=make_worker_factory(records, instances),
+        challenge_factory=codes("A1B2C3D4", "E5F6A7B8", "9ABCDEF0"),
+    )
+
+    terminal = json.loads(next(records.glob("terminal-*.json")).read_text(encoding="utf-8"))
+    native = terminal["controller_result"]
+    first = terminal["review_records"][0]
+    assert status == 2
+    assert native["status"] == "stopped" and native["attempts"] == 2
+    assert len(instances[0].calls) == 2
+    assert first["controller_decision_receipt"] == "observed"
+    assert first["controller_decision_processed"] is True
+    assert first["controller_decision_processing_basis"] == "controller run returned after processing the decision"
 
 
 def test_unauthorized_remediation_does_not_dispatch_another_worker(tmp_path):
@@ -328,8 +414,60 @@ def test_interrupt_before_human_callback_return_does_not_claim_controller_receip
     assert reference["final_freshness_validation_completed"] is True
     assert reference["decision_record_published"] is True
     assert reference["controller_decision_receipt"] == "unknown"
-    assert reference["controller_decision_processed"] is False
+    assert reference["controller_decision_processed"] is None
+    assert reference["controller_decision_processing_basis"] == "not established by native controller evidence"
     assert "controller_callback_returned" not in reference
+
+
+def test_native_controller_receipt_does_not_overstate_unconfirmed_processing(tmp_path):
+    import inspect
+
+    repo, records = make_repo(tmp_path)
+    task_file = tmp_path / "task.json"
+    write_task(task_file)
+    console = FakeConsole(["START A1B2C3D4", "ACCEPT E5F6A7B8", "meets the criteria"])
+    instances = []
+    source, first_line = inspect.getsourcelines(controller_module.HarnessController._run)
+    decision_branch_line = first_line + next(
+        index for index, line in enumerate(source)
+        if line.strip() == 'if decision.decision == "accept":'
+    )
+    injected = False
+
+    def interrupt_before_decision_branch(frame, event, _argument):
+        nonlocal injected
+        if (
+            not injected and event == "line"
+            and frame.f_code is controller_module.HarnessController._run.__code__
+            and frame.f_lineno == decision_branch_line
+        ):
+            injected = True
+            sys.settrace(None)
+            raise KeyboardInterrupt()
+        return interrupt_before_decision_branch
+
+    sys.settrace(interrupt_before_decision_branch)
+    try:
+        status = control.run_control(
+            args_for(repo, records, task_file), console_factory=lambda: console,
+            worker_factory=make_worker_factory(records, instances),
+            challenge_factory=codes("A1B2C3D4", "E5F6A7B8"),
+        )
+    finally:
+        sys.settrace(None)
+
+    terminal = json.loads(next(records.glob("terminal-*.json")).read_text(encoding="utf-8"))
+    native = terminal["native_evidence"]["harness_evidence"]
+    reference = terminal["review_records"][0]
+    assert injected is True and status == 130
+    assert len(instances[0].calls) == 1
+    assert terminal["controller_result"] is None
+    assert native["attempts"][0]["decision"]["decision"] == "accept"
+    assert native["stage"] == "result-or-retry"
+    assert reference["decision_record_published"] is True
+    assert reference["controller_decision_receipt"] == "observed"
+    assert reference["controller_decision_processed"] is None
+    assert reference["controller_decision_processing_basis"] == "native decision recorded; further processing is unconfirmed"
 
 
 def test_start_record_publication_failure_never_dispatches_worker(tmp_path, monkeypatch):

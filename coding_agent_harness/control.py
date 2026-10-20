@@ -242,22 +242,73 @@ def _review_references(state: _WorkflowState) -> list[dict[str, Any]]:
         return []
     published_decisions = set(state.reviewer.decision_record_published_ids)
     final_freshness = set(state.reviewer.final_freshness_completed_record_ids)
-    return [
-        {
+    native = getattr(state.error, "harness_evidence", None) if state.error is not None else None
+    native_attempts = native.get("attempts") if type(native) is dict else None
+    if type(native_attempts) is not list:
+        native_attempts = []
+    attempts_by_number = {
+        attempt.get("attempt"): attempt
+        for attempt in native_attempts
+        if type(attempt) is dict and type(attempt.get("attempt")) is int
+    }
+
+    references = []
+    # HumanReviewer is called once per controller attempt and appends one
+    # reference per callback, in that same order. Bind each reference to the
+    # matching native attempt record; a later attempt is evidence that a
+    # remediation transition was processed, even if the overall run failed.
+    for attempt_number, reference in enumerate(state.reviewer.review_records, start=1):
+        published = reference.record_id in published_decisions
+        native_attempt = attempts_by_number.get(attempt_number)
+        native_decision = native_attempt.get("decision") if native_attempt is not None else None
+        if type(native_decision) is dict:
+            decision_action = native_decision.get("decision")
+        else:
+            decision_action = getattr(native_decision, "decision", None)
+        native_receipt = decision_action in {"accept", "stop", "remediate"}
+
+        completed_decision = (
+            state.result is not None
+            and published
+            and attempt_number <= state.result.attempts
+        )
+        if completed_decision or native_receipt:
+            receipt = "observed"
+        elif published:
+            receipt = "unknown"
+        else:
+            receipt = "not-applicable"
+
+        following_attempt = attempts_by_number.get(attempt_number + 1)
+        remediation_processed = (
+            receipt == "observed"
+            and decision_action == "remediate"
+            and following_attempt is not None
+        )
+        processed = (
+            True if completed_decision or remediation_processed else None
+        )
+        if completed_decision:
+            processing_basis = "controller run returned after processing the decision"
+        elif remediation_processed:
+            processing_basis = "subsequent native controller attempt record"
+        elif not published:
+            processing_basis = "no human decision record was published"
+        elif native_receipt:
+            processing_basis = "native decision recorded; further processing is unconfirmed"
+        else:
+            processing_basis = "not established by native controller evidence"
+
+        references.append({
             **reference.model_dump(),
-            "decision_record_published": reference.record_id in published_decisions,
+            "controller_attempt": attempt_number,
+            "decision_record_published": published,
             "final_freshness_validation_completed": reference.record_id in final_freshness,
-            "controller_decision_receipt": (
-                "observed" if state.result is not None and reference.record_id in published_decisions
-                else "unknown" if reference.record_id in published_decisions
-                else "not-applicable"
-            ),
-            "controller_decision_processed": (
-                state.result is not None and reference.record_id in published_decisions
-            ),
-        }
-        for reference in state.reviewer.review_records
-    ]
+            "controller_decision_receipt": receipt,
+            "controller_decision_processed": processed,
+            "controller_decision_processing_basis": processing_basis,
+        })
+    return references
 
 
 def _terminal_payload(state: _WorkflowState) -> dict[str, Any]:
