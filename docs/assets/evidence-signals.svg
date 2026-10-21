@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="713" viewBox="0 0 560 624" role="img" aria-labelledby="signals-title signals-desc">
+<title id="signals-title">Worker claims and independently collected observations</title>
+<desc id="signals-desc">Three distinct inputs: a worker claim from stdout, Git evidence captured by the harness, and outcomes from configured verification commands. All feed review. Independent collection is outside the self-report, not a separate security domain.</desc>
+<defs>
+<marker id="signals-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+<path d="M0 1 L7 4 L0 7" fill="none" stroke="#bbc9d1" stroke-width="1.4"/>
+</marker>
+</defs>
+<rect width="560" height="624" rx="16" fill="#11191f"/>
+<g font-family="Segoe UI, Arial, sans-serif">
+<text x="24" y="36" fill="#6de0ce" font-size="20" font-weight="600">02 / EVIDENCE LINEAGE</text>
+<text x="24" y="78" fill="#f2f6f8" font-size="30" font-weight="650">Three inputs. Different weight.</text>
+<rect x="24" y="102" width="512" height="108" rx="10" fill="#1b272f" stroke="#bbc9d1" stroke-width="1.5" stroke-dasharray="6 5"/>
+<text x="44" y="134" fill="#bbc9d1" font-size="20" font-weight="600">CLAIM / WORKER STDOUT</text>
+<text x="44" y="166" fill="#f2f6f8" font-size="25" font-weight="400">“I changed the requested files.”</text>
+<text x="44" y="194" fill="#bbc9d1" font-size="21" font-weight="400">Status, summary, claimed paths, concerns</text>
+<rect x="24" y="232" width="512" height="108" rx="10" fill="#1b272f" stroke="#6de0ce" stroke-width="1.5"/>
+<text x="44" y="264" fill="#6de0ce" font-size="20" font-weight="600">OBSERVATION / GIT COLLECTOR</text>
+<text x="44" y="296" fill="#f2f6f8" font-size="24" font-weight="400">What is visible against the baseline?</text>
+<text x="44" y="324" fill="#bbc9d1" font-size="21" font-weight="400">Paths, patch, commits and capture state</text>
+<rect x="24" y="362" width="512" height="108" rx="10" fill="#1b272f" stroke="#6de0ce" stroke-width="1.5"/>
+<text x="44" y="394" fill="#6de0ce" font-size="20" font-weight="600">OBSERVATION / COMMAND RUNNER</text>
+<text x="44" y="426" fill="#f2f6f8" font-size="23" font-weight="400">What did the configured checks observe?</text>
+<text x="44" y="454" fill="#bbc9d1" font-size="21" font-weight="400">Exit, expectation match, capture / cleanup</text>
+<path d="M24 156 H12 V532 H24 M24 286 H12 M24 416 H12" fill="none" stroke="#bbc9d1" stroke-width="2"/>
+<path d="M12 532 H24" fill="none" stroke="#bbc9d1" stroke-width="2" marker-end="url(#signals-arrow)"/>
+<rect x="24" y="499" width="512" height="66" rx="10" fill="#1b272f" stroke="#f1c27b" stroke-width="1.5"/>
+<text x="44" y="539" fill="#f1c27b" font-size="23" font-weight="600">Review all three; apply acceptance gates.</text>
+<text x="24" y="593" fill="#bbc9d1" font-size="20" font-weight="400">Separate collection ≠ a separate security domain.</text>
+</g>
+</svg>
