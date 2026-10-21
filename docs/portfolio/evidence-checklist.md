@@ -1,0 +1,41 @@
+# Coding Agent Harness — public evidence checklist
+
+Implementation baseline: **977a764cf399cdebf222b444af5d80d186a80878**. All code/test links below are pinned to that revision. Public main was checked on 21 October 2026 and still matched it. No claims from a newer implementation were introduced.
+
+## Final slide sequence and principal claims
+
+| Slide | Sources | Evidence boundary |
+|---|---|---|
+| 1. Don’t trust completion. Verify it. | [Controller](https://github.com/MatiasLaukka/coding-agent-harness/blob/977a764cf399cdebf222b444af5d80d186a80878/coding_agent_harness/controller.py); [single-run orchestrator](https://github.com/MatiasLaukka/coding-agent-harness/blob/977a764cf399cdebf222b444af5d80d186a80878/coding_agent_harness/orchestrator.py) | Completion is a claim. Independent observations and acceptance have different roles. Independence does not imply isolated permissions. |
+| 2. Architecture and trust boundaries | [Single-run sequence](https://github.com/MatiasLaukka/coding-agent-harness/blob/977a764cf399cdebf222b444af5d80d186a80878/coding_agent_harness/orchestrator.py#L81); [control workflow](https://github.com/MatiasLaukka/coding-agent-harness/blob/977a764cf399cdebf222b444af5d80d186a80878/coding_agent_harness/control.py); [human review](https://github.com/MatiasLaukka/coding-agent-harness/blob/977a764cf399cdebf222b444af5d80d186a80878/coding_agent_harness/human_review.py#L434) | Git capture precedes verification. Control adds human authorization and freshness checks. Ready-for-review is not acceptance. |
+| 3. A reproducible offline workflow | [Complete integration test](https://github.com/MatiasLaukka/coding-agent-harness/blob/977a764cf399cdebf222b444af5d80d186a80878/tests/test_cli_integration.py#L11) | Synthetic Python worker, real adapter/Git/verifier. Assertions establish both file changes, passing checks, no findings, unchanged HEAD and unstaged index. One selected test passed again on 21 October 2026. No model or reviewer acceptance. |
+| 4. The first real problems | [PR #1](https://github.com/MatiasLaukka/coding-agent-harness/pull/1); [PR #4](https://github.com/MatiasLaukka/coding-agent-harness/pull/4); [R2 findings](https://github.com/MatiasLaukka/coding-agent-harness/blob/977a764cf399cdebf222b444af5d80d186a80878/docs/reliability-r2-findings.md); [rename regressions](https://github.com/MatiasLaukka/coding-agent-harness/blob/977a764cf399cdebf222b444af5d80d186a80878/tests/test_reliability_r2.py#L81); [Git collection](https://github.com/MatiasLaukka/coding-agent-harness/blob/977a764cf399cdebf222b444af5d80d186a80878/coding_agent_harness/git.py#L1230) | Qwen circumstances are PR-reported history. Rename evidence is verified by implementation and regressions. Correction detects scope violations after writes; it does not prevent them. |
+| 5. Adversarial scrutiny: success after expiry | [PR #6](https://github.com/MatiasLaukka/coding-agent-harness/pull/6); [Monitor ordering](https://github.com/MatiasLaukka/coding-agent-harness/blob/977a764cf399cdebf222b444af5d80d186a80878/coding_agent_harness/process.py#L263); [deadline regressions](https://github.com/MatiasLaukka/coding-agent-harness/blob/977a764cf399cdebf222b444af5d80d186a80878/tests/test_reliability_r3.py#L739) | 50 ms and 400 ms are synthetic-clock values, not performance measurements. Nine cases cover monitor timing, controller actions and verification expectations. No new full-suite or deadline-suite run is claimed. |
+| 6. Human authority and truthful evidence | [PR #9](https://github.com/MatiasLaukka/coding-agent-harness/pull/9); [publication/freshness](https://github.com/MatiasLaukka/coding-agent-harness/blob/977a764cf399cdebf222b444af5d80d186a80878/coding_agent_harness/human_review.py#L506); [audit projection](https://github.com/MatiasLaukka/coding-agent-harness/blob/977a764cf399cdebf222b444af5d80d186a80878/coding_agent_harness/control.py#L243) | Control permits zero or one enabled remediation with fixed scope. A published request is not proof of receipt/processing. Records are unauthenticated and carry no resume authority. |
+| 7. What the evidence actually establishes | [PR #9](https://github.com/MatiasLaukka/coding-agent-harness/pull/9); [PR #1](https://github.com/MatiasLaukka/coding-agent-harness/pull/1); [historical validation context](../portfolio-review.md#initial-overhaul-validation-record) | 575 is an inspected historical offline result. 123 is PR-reported targeted AI review coverage. Counts are not additive. One reported Qwen eligibility acceptance is a smaller historical note, with raw artifacts uninspected and no causation/repeatability claim. |
+| 8. Engineering contribution and lessons | [PR #8](https://github.com/MatiasLaukka/coding-agent-harness/pull/8); [Report implementation](https://github.com/MatiasLaukka/coding-agent-harness/blob/977a764cf399cdebf222b444af5d80d186a80878/coding_agent_harness/report.py); [README](../../README.md) and [engineering decisions](../engineering-decisions.md) | Direction, requirements, review priorities and acceptance decisions are owner-reported. Extensive AI collaboration is explicit. Individual invention/discovery credit remains uncertain. Future validation is a possibility. |
+
+## Reproduce the offline demonstration
+
+In a clone of the pinned revision, use Python 3.12+, Git, and the project development dependencies. Run:
+
+~~~text
+python -m pytest tests/test_cli_integration.py -q
+~~~
+
+The test creates a temporary repository and a synthetic Python worker. It keeps the real worker adapter, orchestrator, Git collector and independent verifier. The slide is an explanatory diagram of test assertions, not a terminal screenshot. A fresh selected-test run passed on Windows/Python 3.12.14 on 21 October 2026 against a separate extraction of the baseline. That one-test check is separate from the historical 575 and 123 results. No model, provider call or benchmark was run.
+
+## Companion documentation
+
+The presentation supplements the [README](../../README.md). See the [architecture](../architecture.md), [engineering decisions](../engineering-decisions.md), [engineering findings](../engineering-notes.md), [report contract](../reports.md), and [documentation review](../portfolio-review.md). These documents accompany this publication; implementation links remain pinned to the audited baseline.
+
+The [PDF](coding-agent-harness-case-study.pdf) and [editable PowerPoint](coding-agent-harness-case-study.pptx) contain the same eight-slide sequence. [Speaker notes](speaker-notes.md) preserve the five-minute narration and qualifications. Publication corrections update note references without changing slide content.
+
+## Evidence provenance and remaining questions
+
+- **575-test evidence:** an archived Windows full-suite log from the documentation overhaul was inspected; the [documentation review](../portfolio-review.md#initial-overhaul-validation-record) describes its context. The full suite was not rerun for this presentation. PR #9 separately reports its own implementation validation and targeted AI review.
+- **Attribution:** owner-provided background describes leadership. The [public decision summary](../engineering-decisions.md) distinguishes implementation evidence, owner-reported direction, substantial AI collaboration, and uncertain individual origin. No sole-inventor claim is made.
+- **Qwen experiment:** PR #1 reports eligibility-stage acceptance while 18 original feature tests remained advisory failures. Raw artifacts were not inspected. Stronger causation, repeatability or full-feature claims remain unsupported.
+- **Operating limits:** no sandbox; Git-visible observations only; caller-selected checks; point-in-time freshness; sensitive, unauthenticated records; no universal OS containment or crash-durability guarantee. Production readiness, broad console/backend support and semantic correctness remain unestablished.
+
+Public PR descriptions were re-read through GitHub on 21 October 2026. They can change after merge, so code/test references use immutable revision links. All public URLs in the deck notes and this checklist were checked during finalization. This publication packages documentation and presentation artifacts; it does not change application behavior. Fresh publication checks are recorded separately in the [documentation review](../portfolio-review.md#publication-validation).

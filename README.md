@@ -1,440 +1,151 @@
-# Coding Agent Harness
+# ![Coding Agent Harness](docs/assets/identity.svg)
 
-A Python prototype for delegating bounded coding tasks to a local worker process, collecting independent evidence, and keeping acceptance decisions under reviewer control.
+**Completion is a claim. Acceptance needs evidence.**
 
-The central idea is simple: a worker's completion message is a claim. Git changes and verification results provide separate evidence for evaluating that claim.
+A Python orchestration harness for bounded coding tasks. It runs a worker, collects Git evidence separately from the worker’s account, executes configured checks, and makes review an explicit step.
 
-**Status:** experimental, version 0.1.0. The controller and single-run CLI are covered by offline tests, including real Git evidence and an offline worker subprocess. Limited real local Qwen Code/Ollama experiments have exercised coding tasks and controller acceptance, with both accepted and stopped outcomes. These experiments do not establish repeatability, comprehensive backend validation or production readiness.
+Built around a question: **what must be observed—and who must decide—before an agent’s work can be accepted?** The answer includes failure, disagreement, and permission to try again.
 
-## Architecture
+**Experimental · Python 3.12+ · Offline regression suite · Windows console review**
 
-```mermaid
-flowchart TD
-    P[Caller / external planner] --> T[Validated TaskPacket]
-    T --> C[HarnessController]
-    C --> W[Worker process]
-    W --> R[Structured completion claim]
-    C --> G[Independent Git evidence]
-    C --> V[Verification commands]
-    R --> J[Caller-supplied reviewer]
-    G --> J
-    V --> J
-    J --> D{ReviewDecision}
-    D -->|accept / stop| O[Result and audit events]
-    D -->|remediate / revise-scope| C
-```
+[Try the offline workflow](#try-it-without-a-model) · [Architecture](docs/architecture.md) · [CLI guide](docs/usage.md) · [Engineering findings](docs/engineering-notes.md)
 
-| Component | Responsibility |
-| --- | --- |
-| `models.py` | Strict task, completion, verification-command, and review-decision schemas; unknown fields are rejected. |
-| `worker.py` | Qwen CLI subprocess adapter, task prompt, `HARNESS_RESULT:` parsing, and worker outcome classification. |
-| `git.py` | Clean baseline, cumulative patch/status/commit evidence, and dirty-safe per-attempt snapshots. |
-| `verifier.py` / `process.py` | Independent command execution, output and exit-code capture, timeouts, and process-tree termination. |
-| `controller.py` | Reviewer-driven acceptance, audited scope changes, and a shared bounded retry budget. |
-| `orchestrator.py` / `cli.py` | Separate single-run path with mechanical findings and a console review surface. |
+## The problem with “done”
 
-### Planner, worker, and reviewer boundaries
+An agent’s completion claim is not independent evidence that the work was done correctly. A valid completion message cannot establish that the right files changed, that checks passed, or that a human authorized acceptance. A passing test also cannot decide whether another worker invocation is authorized.
 
-The caller supplies a `TaskPacket`: goal, constraints, acceptance criteria, suggested files, and optional allowed files. Planning is an upstream responsibility; no hosted planner adapter or provider SDK is implemented here.
+The harness keeps three inputs separate: **what the worker claims**, **what Git records**, and **what configured verification observes**. “Independent” means collected outside the worker’s self-report; the processes still share the operator’s machine and permissions. Acceptance remains a separate decision.
 
-`QwenWorker` invokes a caller-configured executable as `qwen --model <model> -p <prompt>`. It expects exactly one JSON completion line prefixed by `HARNESS_RESULT:`. Multiple records or duplicate JSON keys are protocol failures; raw process output remains available. The result contains `status`, `summary`, `changed_files`, and `remaining_concerns`. Changed-file claims refer only to the current worker invocation. A local subprocess does not imply local model inference; the Qwen executable's own configuration determines its backend.
+## How it works
 
-The controller accepts a caller-supplied reviewer with a `review(...)` method. It receives the current task, worker result and assessment, cumulative Git evidence, verification results, and attempt number, and returns a `ReviewDecision`: `accept`, `remediate`, `stop`, or `revise-scope`. No concrete hosted reviewer integration is included.
+The caller supplies a task, acceptance criteria, file scope, and verification commands. The harness requires a clean Git baseline, invokes a worker process, captures Git evidence after it exits, and runs the checks.
 
-### Independent Git evidence
+![Two execution paths: worker claims and separately collected Git and check evidence feed either single-run findings or human review with controller gates.](docs/assets/evidence-lifecycle.svg)
 
-A run starts from a clean Git repository. Evidence is captured immediately after each worker invocation, before verification and review. Cumulative evidence remains anchored to the original commit and includes changed paths, a patch including non-ignored untracked files, observed status/HEAD, and newly created commits.
+*Read top to bottom: execute, observe, verify, then apply the selected workflow. Dashed cards mark claims, teal marks harness observations, and amber marks human authority. These are logical roles, not sandbox boundaries.*
 
-Before each worker invocation, the controller captures the current worktree using a temporary Git index and `write-tree`. After the invocation, it compares trees to obtain that attempt's changes without staging files in the real index. This works across remediation attempts even when previous attempts left changes in the worktree.
+There are two execution paths:
 
-Worker/Git disagreement is an audit event in the controller, not an acceptance veto. Git-observed cumulative changes remain authoritative for scope checks. The separate single-run orchestrator reports disagreement as a mechanical finding.
+| | `run` — one invocation | `control` — human review |
+| --- | --- | --- |
+| Outcome | `ready-for-review` or `needs-attention` | Controller acceptance or a nonaccepted outcome |
+| Authorization | Invoking the command starts the workflow | Fresh `START` confirmation before first dispatch |
+| Review | Mechanical findings for the caller | Human sees claims, Git evidence, patch, and check results |
+| Another attempt | None | At most one remediation, explicitly enabled and freshly authorized |
+| Saved evidence | Optional Markdown report | Required start, review, and terminal JSON records |
 
-### Verification, scope, and bounded remediation
+**`ready-for-review` is not acceptance.** `control` is the provided human interface to `HarnessController`; it does not turn `run` into an approval workflow.
 
-Verification commands are argument arrays executed independently after each worker attempt. Results record exit code, timeout, stdout, stderr, and elapsed time. This is deterministic command-based gating; reproducibility still depends on the supplied commands and environment.
+Git evidence is captured **after the worker, before verification**. In `control`, additional freshness checks reject Git-visible drift at review entry and immediately before a decision returns to the controller. These are point-in-time observations, not a lock on the repository.
 
-- `must_pass` (default): a nonzero exit or timeout prevents acceptance.
-- `expected_failure`: requires a reason; an ordinary failure meets the expectation, an unexpected pass is audited, and a timeout prevents overall success.
-- `advisory`: recorded without affecting overall success.
+## Try it without a model
 
-An empty command list performs no checks and currently yields success. Callers must supply meaningful verification.
-
-`allowed_files=None` imposes no file restriction; `[]` permits no changed files; a list is an exact repository-relative allowlist. Scope checks detect cumulative out-of-scope changes immediately after the worker invocation. Rename sources and destinations are both changed paths and both require allowlist coverage. They do not prevent writes or roll them back. Filesystem changes made by verification commands or the reviewer are not recaptured before acceptance. A reviewer can explicitly revise scope with a nonempty list and rationale; the revision is audited and subsequent remediation preserves it.
-
-Remediation and scope revision share `max_remediation_attempts` (default 2), allowing at most three worker invocations by default. The reviewer cannot accept an execution/protocol failure, a scope violation, or failed required verification. A valid worker report of `blocked` or `failed` may be accepted by the reviewer with a disagreement audit event.
-
-## Installation
-
-Requires Python 3.12+ and Git on `PATH`. From a clone of this repository:
+From a clone, with Python 3.12+ and Git on `PATH`:
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -e ".[dev]"
 coding-harness --help
+python -m pytest tests/test_cli_integration.py -q
 ```
 
-On POSIX shells, activate with `source .venv/bin/activate`. Running a real worker also requires an independently installed and configured Qwen executable and an available model identifier. No models, credentials, or provider configuration are bundled.
+On POSIX, activate with `source .venv/bin/activate`.
 
-## Usage
+The integration test creates a temporary repository and launches a synthetic Python worker through the real worker adapter. It changes a tracked file, adds a new file, collects real Git evidence, and runs independent content assertions. It checks that the command returns `ready-for-review`, the patch contains both changes, HEAD stays at the baseline, and the real index stays unstaged. **No model, credentials, or provider calls are needed.** This is a reproducible test demonstration, not a standalone demo command.
 
-### Task specification
-
-The CLI reads a JSON object with `task` and `verification_commands`. Save the task file outside the clean target repository, or track and commit it before starting a run. For example:
-
-```json
-{
-  "task": {
-    "task_id": "bounded-fix",
-    "goal": "Correct the edge case in src/example.py.",
-    "constraints": ["Do not change unrelated behavior."],
-    "acceptance": ["The existing example tests pass."],
-    "suggested_files": ["src/example.py"],
-    "allowed_files": ["src/example.py"]
-  },
-  "verification_commands": [
-    {
-      "id": "focused-tests",
-      "argv": ["python", "-m", "pytest", "tests/test_example.py", "-q"],
-      "timeout_seconds": 120,
-      "expectation": "must_pass"
-    }
-  ]
-}
-```
-
-Adapt the paths and commands to the target project. Verification executables resolve in the harness process's environment; activate the appropriate environment before running.
-
-### CLI
+Exercise the human workflow's orchestration with scripted console input and a synthetic worker:
 
 ```powershell
-coding-harness run --help
-coding-harness run task.json --repo ..\target-worktree --model YOUR_CONFIGURED_QWEN_MODEL
+python -m pytest tests/test_control.py -q
 ```
 
-`YOUR_CONFIGURED_QWEN_MODEL` is a placeholder for your configured model identifier. Implemented options are `--repo`, `--model`, `--qwen-command` (default `qwen`), `--worker-timeout` (default 600 seconds), and optional `--report-dir DIR`.
+That suite covers authorization, one permitted remediation, freshness failures, and record publication. It does not replace manually testing a real Windows console. See the [CLI guide](docs/usage.md) for task JSON and configured-worker usage.
 
-The CLI calls the single-run orchestrator, not `HarnessController`; it does not expose reviewer-controlled remediation. Its result codes are 0 for `ready-for-review`, 2 for mechanical findings, and 1 for loading/runtime errors. Ready for review is not reviewer acceptance.
+## Decisions that shape the system
 
-### Saved single-run reports
+The architecture grew through concrete failure investigation. Three decisions explain its shape.
 
-```powershell
-coding-harness run task.json --repo D:\work\target --model YOUR_CONFIGURED_QWEN_MODEL --report-dir D:\reports\harness
-```
+### 1. Fix the evidence before trusting the gate
 
-Reports are opt-in. The operator must supply an **existing dedicated report-only
-directory**; the harness never creates it. Relative directories are relative to
-the harness process's working directory. The harness chooses opaque ASCII
-`run-<uuid>.md` filenames, independent of task, repository, worker and model text.
-After confirmed publication it prints `Report saved: "<canonical path>"` to
-stderr, with the path encoded as a JSON string so spaces and control characters
-are unambiguous. Normal stdout and completed-run exit codes 0 and 2 are unchanged.
-The old `--report PATH` interface has been removed: both `--report PATH` and
-`--report=PATH` are usage errors. Run options cannot be abbreviated.
+An allowlist only works if the changed-path evidence is complete. In the [R2 reproduction](docs/reliability-r2-findings.md#r2-1-rename-source-omitted-from-scope-evidence--high-severity), only `renamed.txt` was allowed. Moving `existing.txt` there could hide the deleted source from Git’s name-only output. An accepting reviewer then produced an accepted result.
 
-**Operator trust boundary:** the directory, its temporary files, and its final
-reports must remain independent of operational inputs throughout publication.
-This includes Git configuration and included files, object stores and alternates,
-refs and metadata, application code, worker and verification inputs, hooks, and
-watched or automatically consumed files. A directory outside the repository is
-**not automatically independent**. For example, an external, initially nonexistent
-`include.path` file is still a Git input: designating its parent as a report-only
-directory violates this contract if publication can create or affect that input.
-The harness does not discover or certify these dependencies. Operators must also
-keep the canonical directory and its trusted ancestors stable through publication.
-There is no guarantee against hostile concurrent directory/junction replacement,
-arbitrary same-user filesystem configurations, or malicious operators.
+![A rename from forbidden existing.txt to allowed renamed.txt previously hid the source. Disabling rename collapsing exposes both paths, so the same acceptance request is rejected with scope-violation.](docs/assets/rename-scope-bypass.svg)
 
-Before worker setup, report mode requires `--repo` to identify the **actual Git
-worktree root** after canonicalization. Subdirectories, including those with
-misleading nested `.git` markers, are rejected. Non-reporting runs retain their
-existing behavior. One fixed, read-only `git rev-parse` layout query obtains the
-worktree, administrative Git directory, and common Git directory. It uses the
-bounded process runner with a 10-second phase budget, 16 KiB stdout and 4 KiB
-stderr caps, optional locks disabled, and fsmonitor disabled. Failed, incomplete,
-ambiguous or unavailable discovery fails closed. Bare repositories are unsupported.
-Nonempty `GIT_DIR`, `GIT_COMMON_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`,
-`GIT_OBJECT_DIRECTORY`, and `GIT_ALTERNATE_OBJECT_DIRECTORIES` environment overrides
-are unsupported in report mode.
+*The correction changes evidence collection, not filesystem permissions. Both rename endpoints now count toward scope; the human-readable patch can still show a rename.*
 
-The report directory and known roots are canonicalized, including Windows case
-aliases, extended DOS/UNC path spellings, symlinks and junctions. Other Windows
-path namespaces or aliases that cannot be verified safely are unsupported. Equality or containment **in either direction**
-with the worktree/admin/common roots rejects before worker setup. Linked worktrees
-and separate Git directories are supported when Git resolves the supplied path as
-the actual worktree root; a `core.worktree` redirect does not permit supplying a
-different discovery directory. These direct-root checks prevent common mistakes;
-they do **not** certify complete operational independence. Git logical references
-such as configuration includes and alternates are not recursively inspected.
-There is no metadata-tree scanner. The validated paths are frozen before dispatch;
-publication does not query Git again or collect fresh run evidence.
+[PR #4](https://github.com/MatiasLaukka/coding-agent-harness/pull/4) corrected both cumulative and per-attempt collectors. Regressions cover unstaged, staged, and committed moves, controller rejection, single-run findings, and exported handoff evidence. [See the failure, correction, and tests →](docs/engineering-notes.md#case-study-a-rename-hid-an-out-of-scope-deletion)
 
-The report retains the returned task requirements, captured outcome and findings,
-untrusted worker claims, observed worker process output and capture flags,
-independent Git paths and SHAs, ordered verification specifications and results,
-and the captured patch. **ready-for-review is not reviewer acceptance.** This
-single-run path records no reviewer acceptance. Zero configured checks and missing
-worker completion are shown explicitly. Markdown prose is escaped, and captured
-logs and patches use fences longer than embedded backtick runs.
+### 2. Make another attempt an explicit decision
 
-**Reports may contain sensitive local code and output**, task prose, command
-arguments, paths, and worker claims. They are not redacted or signed. Review them
-before sharing. Treat contents as untrusted material, including instructions and
-links in captured output.
+The same review found that malformed reviewer output could fall through into remediation. Type annotations and model-instance identity were insufficient: the controller now rebuilds and validates each decision before branching, and requires an exact nonnegative integer retry budget.
 
-Only executions returning `TaskRunResult` produce completed-run reports, including
-`needs-attention`. Exceptions and interruptions before that return retain existing
-sanitized failure reporting and produce no completed-run report. Rendering reads
-only captured records; it invokes no worker, verification, or Git collection.
-Git evidence remains the snapshot after the worker and before verification;
-later verification side effects are outside it.
+The later `control` workflow makes the human boundary visible: `START` before the first dispatch; fresh action challenges for `ACCEPT` and `REMEDIATE`; decision publication and final freshness before callback return. Its scope stays fixed, with zero or one enabled remediation. The library separately supports explicit scope revision within a shared retry budget.
 
-Publication writes UTF-8 to a private, harness-named temporary file in the report
-directory, flushes and fsyncs it, closes it, then uses an atomic create-only hard
-link. Existing or concurrently created destinations are never overwritten. A
-collision or publication failure returns 1 without retrying the worker, repeating
-verification, or recollecting evidence. Filesystems without hard-link support
-fail closed; there is no overwrite fallback. Temporary files are removed where
-the OS permits. Cleanup failure can leave a temporary file or an already complete
-published report and returns 1; a success path is printed only after publication
-and cleanup return successfully. A crash can leave a temporary file. This is not
-a crash-durable archive: directory metadata is not fsynced. The feature adds no
-approval, remediation, resume, controller-history, or supervisor workflow.
+A saved request is not proof that the controller received or processed it. Records preserve those distinctions where observable. [Follow the authorization path →](docs/architecture.md#human-authority-in-control)
 
-### Human-reviewed controller CLI
+### 3. Prefer a narrower guarantee that the evidence supports
 
-`coding-harness control` runs the existing `HarnessController` in the foreground with a bounded Windows console reviewer:
+An output directory outside the checkout can still be a Git include, hook input, or watched resource. The final [reporting redesign](https://github.com/MatiasLaukka/coding-agent-harness/pull/8) removed recursive metadata scanning and adopted an operator-trusted, stable `--report-dir` contract. Known-root checks and create-only publication are useful; they cannot certify operational independence.
 
-```powershell
-coding-harness control task.json --repo D:\work\target-worktree --model YOUR_CONFIGURED_QWEN_MODEL --record-dir D:\work\harness-records
-```
+The same restraint applies to subprocess reliability: bounded waits and capture preserve incomplete output and cleanup uncertainty, without promising OS containment. [Engineering findings](docs/engineering-notes.md) trace the timeout and disclosure corrections to historical reproductions and current regressions.
 
-The task file uses the task and verification-command shape above. This command requires an explicit nonempty `allowed_files` list and at least one non-advisory verification check. Check IDs must be unique. Task text, paths, arguments, check counts, and timeouts have finite bounds. `--max-remediation-attempts` accepts only `0` or `1` (default `0`); `--review-timeout` accepts 1–1,800 seconds (default 300). The process uses `DEVNULL` for worker and verification stdin. A genuine Windows console input handle and console output screen buffer are required before authorization or worker dispatch.
+These are AI-assisted development and review records, not independent human security audits.
 
-Before dispatch, the CLI displays the validated task, exact checks and commands, model, worker command and exact first-dispatch argv, timeout, file scope, budget, canonical worktree and Git metadata roots, and a clean baseline. The operator types a fresh `START <challenge>`. This authorizes exactly the first dispatch under that configuration. A start record must publish successfully before the controller is called. The controller independently captures its baseline and rejects a mismatch with the displayed baseline before invoking the worker.
+## Supported interfaces
 
-After each worker attempt and verification, the reviewer sees the worker claim and process status, independent cumulative Git evidence and full captured patch, changed paths and scope observation, verification outcomes and infrastructure flags, the attempt and remaining remediation budget, and an explicit statement that acceptance has not occurred. Cumulative changes are evidence from the approved baseline; they are not presented as per-attempt deltas. The operator can enter `ACCEPT <challenge>`, `STOP`, or, when budget remains, `REMEDIATE <challenge>`. Acceptance and remediation require a bounded nonblank rationale; remediation also requires bounded instructions. Each action uses one challenge confirmation. The controller remains responsible for acceptance gates and may reject a human acceptance request. The initial START does not authorize acceptance or remediation.
+| Interface | Purpose |
+| --- | --- |
+| `coding-harness run` | Single worker invocation, Git evidence, verification, mechanical findings; optional `--report-dir DIR`. |
+| `coding-harness control` | Foreground Windows console authorization and review; requires `--record-dir DIR`. |
+| `coding-harness handoff validate` | Validate supervisor proposals and operator approval documents; optionally materialize a task file. |
+| `coding-harness handoff preflight` | Check exact approved inputs and current repository identity without executing them. |
+| Python `HarnessController` | Integrate a caller-supplied worker and reviewer, including audited scope revision. |
 
-The controller captures a bounded Git observation immediately after the worker and before verification. It includes a SHA-256 fingerprint over the exact bytes from `git ls-files --stage -z`, including staged paths, modes, object IDs, and stages; incidental index-file timestamps are not part of the fingerprint. At review entry, the CLI recollects Git-visible state against the same baseline and fails closed if it differs, including changes caused by verification. After publishing a human decision record, it makes one final bounded freshness check before returning that decision to the controller. It does not update the packet, rerun verification, or retry the worker after a freshness failure. These checks compare point-in-time observations; a concurrent change can still occur after the final check or between operations. OS filesystem calls may block, so the workflow does not claim a universal hard wall-clock bound.
-
-`--record-dir` must name an existing trusted directory dedicated to records and outside the repository and its Git metadata. The CLI publishes create-only `start-<uuid>.json`, `review-<uuid>.json`, and `terminal-<uuid>.json` records, linked by workflow and record identifiers and digests. Start publication precedes dispatch; decision-bearing review publication precedes the controller callback return; a terminal record captures the actual controller result or available failure evidence. A missing terminal record means the workflow is incomplete. Records can contain sensitive, unredacted tasks, commands, source, diffs, and output. They are not tamper-proof, authenticated, or crash-durable, and must not be treated as authorization or resume checkpoints. The operator must keep this directory independent of all operational resources throughout publication; being outside the worktree alone does not certify independence.
-
-Exit codes are `0` for controller acceptance with terminal publication, `2` for a completed nonaccepted outcome with terminal publication, `1` for workflow/evidence/input/publication errors, and `130` for Ctrl+C. If terminal publication fails after the controller returns, the CLI reports that failure while preserving the actual outcome in available native evidence; it does not invent a different controller decision. No push, pull request, or merge is performed.
-### Controller integration
-
-For reviewer-driven runs, use `HarnessController(worker=..., reviewer=..., max_remediation_attempts=2)` and call `run(task=..., repo_dir=..., verification_commands=...)`. Supply a worker implementing `run(*, task, repo_dir)` and a reviewer implementing:
-
-```python
-review(*, task, worker_result, worker_assessment, evidence, verification, attempt)
-```
-
-The reviewer must return a validated `ReviewDecision`. The controller revalidates it before branching; malformed decisions raise without authorizing another worker invocation. Remediation budgets must be nonnegative integers; booleans and nonfinite or fractional values are rejected. `QwenWorker` is the provided worker adapter. The `control` command is the provided human review surface; no hosted reviewer integration is included. The returned `HarnessRunResult` contains status, attempt count, and audit events; evidence is passed to the reviewer rather than persisted automatically.
+The provided adapter invokes a configured Qwen executable. A local executable does **not** imply local inference: its configuration determines the backend. No model, credentials, hosted planner, or hosted reviewer is bundled. The [CLI guide](docs/usage.md) documents options, exit codes, and the differences between CLI and library defaults.
 
 ## Offline supervisor handoff
 
-The sidecar in `coding_agent_harness.supervisor` exchanges three strict JSON
-documents: `SupervisorProposal`, `OperatorApproval`, and `HandoffSummary`.
-It makes no model calls and never executes a proposal. An external supervisor
-can propose a task, review, escalation, or stop. A review is a recommendation;
-it is never substituted for a controller decision. An acceptance recommendation
-may only acknowledge an already accepted, consistently recorded controller run.
+The sidecar exchanges supervisor proposals, operator approvals, and evidence summaries without executing proposals. The single-run CLI and bare controller are **approval-unaware** with respect to these approval files; `control` has its own foreground human authorization.
 
-Proposals reuse `TaskPacket`, ordered `VerificationCommand` records and an
-`ExecutionConfig`. They require an explicit exact file allowlist (an empty list
-permits no edits), unique checks including a required check, finite timeouts,
-and zero remediation retries. Worker argv, model and optional runtime limits
-are operator-selected data, not executed during validation. CLI limit support
-and actual launcher/provider settings remain the operator's responsibility.
+The trusted caller must run `execution_preflight` against the exact objects before an explicit controller call. Summaries distinguish missing required history from unavailable **optional per-attempt** snapshots. Integrity hashes do not authenticate a human; protected approval storage and the caller's inventory of writable roots remain trust assumptions. See the [manual handoff guide](docs/supervisor-handoff.md).
 
-### One manually supervised round trip
+## Verification and evidence
 
-Use a clean disposable target, an exchange directory, and a **protected operator
-directory outside every worker- and supervisor-writable workspace**. Inspect
-the complete proposed task, file scope, checks and execution settings first.
-The following is an operator-side example for an initial task proposal.
-`proposal.json` is written by the supervisor into the exchange directory;
-the operator supplies the paths and a trusted existing reviewer.
-
-```python
-from pathlib import Path
-from coding_agent_harness.supervisor import (
-    OperatorApproval, canonical_json, canonical_digest, inspect_repository,
-    load_proposal,
-)
-
-repo = Path("target-worktree").resolve()
-exchange = Path("supervisor-exchange").resolve()
-approval_dir = Path("operator-controlled-approvals").resolve()
-proposal = load_proposal(exchange / "proposal.json")
-spec = proposal.task_spec
-assert proposal.action == "task"
-assert inspect_repository(repo) == proposal.repository
-
-# HUMAN CHECKPOINT: inspect spec.task, spec.verification_commands and
-# spec.execution_config before creating this exact approval.
-approval = OperatorApproval(
-    proposal_sha256=canonical_digest(proposal),
-    repository=proposal.repository,
-    task_sha256=canonical_digest(spec.task),
-    allowed_files=list(spec.task.allowed_files),
-    verification_sha256=canonical_digest([
-        check.model_dump(mode="json") for check in spec.verification_commands
-    ]),
-    execution_config_sha256=canonical_digest(spec.execution_config),
-    approve_task=True, approve_scope=True,
-    approve_checks=True, approve_configuration=True,
-)
-# Operator creates this file; never expose approval_dir to the supervisor.
-approval_path = approval_dir / "approved.json"
-with approval_path.open("xb") as stream:
-    stream.write(canonical_json(approval))
-```
-
-Document validation may create an existing-compatible task file. It reports
-`approval_validated`, which is distinct from a fresh execution preflight:
-
-```powershell
-coding-harness handoff validate supervisor-exchange/proposal.json `
-  --repo target-worktree --approval operator-controlled-approvals/approved.json `
-  --approval-dir operator-controlled-approvals --untrusted-root supervisor-exchange `
-  --output task.json
-
-coding-harness handoff preflight supervisor-exchange/proposal.json `
-  --repo target-worktree --approval operator-controlled-approvals/approved.json `
-  --approval-dir operator-controlled-approvals --untrusted-root supervisor-exchange `
-  --task-file task.json --execution-config execution-config.json
-```
-
-`execution-config.json` must contain the exact approved `ExecutionConfig`.
-`--untrusted-root` is repeatable: supply every additional worker/supervisor
-writable root; the target is always included. Use `--handoff summary.json` for
-proposals referring to a prior run. Validation/preflight return 0 on success,
-2 for missing approval or failed preflight, and 1 for malformed/contradictory
-documents or output errors. Outputs are create-only and errors do not echo
-untrusted input. No supervisor execute or approval-writing CLI exists.
-
-Immediately before an explicit controller call, the **trusted caller** must
-reread approval and check the actual objects it will execute:
-
-```python
-from coding_agent_harness.controller import HarnessController
-from coding_agent_harness.worker import QwenWorker
-from coding_agent_harness.supervisor import (
-    ExceptionObservation, RecordedRun, RecordingReviewer, build_handoff,
-    execution_preflight, write_handoff,
-)
-
-cfg = spec.execution_config
-# Operator has separately verified argv, CLI limits and local runtime settings.
-worker = QwenWorker(command=cfg.command_prefix, model=cfg.model,
-                    timeout_seconds=cfg.worker_timeout_seconds)
-recorder = RecordingReviewer(trusted_reviewer)  # Supplied by the operator.
-controller = HarnessController(worker=worker, reviewer=recorder,
-                               max_remediation_attempts=cfg.max_remediation_attempts)
-preflight = execution_preflight(
-    proposal, handoff=None, approval_path=approval_path,
-    trusted_approval_dir=approval_dir,
-    untrusted_workspace_roots=[exchange], repo_dir=repo,
-    task=spec.task, verification_commands=spec.verification_commands,
-    execution_config=cfg,
-)
-if not preflight.passed:
-    raise RuntimeError("Preflight failed; do not invoke the worker")
-
-result = None
-exception = None
-observed_error = None
-try:
-    result = controller.run(task=spec.task, repo_dir=repo,
-                            verification_commands=spec.verification_commands)
-except Exception as error:
-    observed_error = error
-    # An exception is not an invented stopped/accepted HarnessRunResult.
-    exception = ExceptionObservation(stage="controller",
-                                     type_name=type(error).__name__)
-record = RecordedRun(
-    run_id="supervised-run", original_task=spec.task,
-    verification_commands=spec.verification_commands,
-    baseline=preflight.repository, baseline_source="trusted_preflight",
-    controller_max_remediation_attempts=cfg.max_remediation_attempts,
-    callbacks=recorder.records, result=result, exception=exception,
-)
-write_handoff(exchange / "summary.json", build_handoff(record))
-if observed_error is not None:
-    raise observed_error
-# Inspect the summary before sharing it.
-```
-
-The supervisor can now read the summary and propose another narrow task or a
-nonexecuting remediation/escalation/stop recommendation. The operator decides
-whether to continue. A nested follow-up task is context only: execution needs
-a separately submitted task proposal, exact new approval and a clean approved
-baseline. The sidecar never commits, cleans or promotes a stopped run's state.
-
-### Evidence and trust limitations
-
-`RecordingReviewer` copies callback inputs, returns the delegate's exact
-decision, and re-raises reviewer exceptions. Export checks original task and
-baseline identities, ordered checks and verifier semantics, retry lineage,
-final controller branches and observable audit payloads/order. Contradictory
-provenance is rejected; original source records and controller results are
-never repaired or replaced. Missing required callbacks/baseline/budget are
-explicit. Unavailable **optional per-attempt** Git snapshots are separate:
-an actual accepted result with complete required callback history remains
-reportable. Dependent audit details are preserved but not claimed independently
-verified; missing snapshots or audits are never reconstructed.
-
-Summaries separate worker completion claims from Git observations, process
-status, verification outcomes and recorded reviewer decisions. File-scope
-compliance does not prove semantic task-scope compliance:
-`semantic_task_scope` is always `not_assessed_by_handoff`. Valid blocked/failed
-worker acceptance retains existing controller semantics and disagreement audits.
-
-Wire JSON is limited to 64 KiB, 32 attempts and 64 checks/paths/audits; excess
-is rejected rather than truncated. Duplicate keys, scalar coercion, unsupported
-versions/actions and ambiguous Windows/Git-internal proposal paths are rejected.
-Hashes use UTF-8 sorted-key compact JSON with defaults/nulls and ordered arrays,
-without Unicode normalization; this is not RFC 8785. Default summaries omit
-logs, diffs, argv, free-form summaries/rationales and status text. Retained labels
-and paths are SHA-256 pseudonyms; original source digests and counts are retained.
-These summaries can ground a next-step request but cannot alone prove semantic
-correctness. Inspect them before sharing; metadata/digests are not a secrecy
-guarantee, and additional evidence needs separate operator review.
-
-**Integrity hashes do not authenticate a human.** The operator directory and
-caller inventory of writable roots are trusted; resolved-path checks are not
-ACL enforcement. Same-user workers may otherwise write anywhere. Filesystem
-compromise or forged approvals within the trusted directory are outside this
-prototype's guarantees. There is no signature/authentication service or sandbox.
-
-The existing run CLI and controller remain **approval-unaware**. A direct caller
-can bypass the sidecar. Preflight uses fixed read-only Git commands with optional
-locking and filesystem monitoring disabled; it does not run approved argv,
-workers or checks. A pass is a point-in-time observation, not a lock or execution
-capability. Repeat it if documents, Git state or runtime configuration change.
-Ignored files, hidden settings, concurrent modifications and verifier/reviewer
-side effects remain limitations. No live hosted supervisor integration exists;
-a future adapter reads summaries and writes proposals, without receiving an
-approval writer or process/controller capability.
-
-## Testing
+The offline suite uses temporary Git repositories, synthetic workers, scripted reviewers, real finite subprocesses, controlled clocks, and failure injection. It covers protocol ambiguity, rename scope, retry authority, timeouts, output limits, cleanup ownership, freshness, and publication failure.
 
 ```powershell
 python -m pytest -q
-python -m pytest tests/test_controller.py -q
 ```
 
-Tests use fake workers/reviewers and temporary Git repositories. They cover schemas, process execution/timeouts, Git evidence, worker protocol/outcomes, verification expectations, CLI presentation, scope checks, and bounded remediation. They do not require live model calls. An offline CLI integration test exercises the real worker adapter, Git evidence, and verification commands using a synthetic worker process. Passing offline tests does not validate an installed Qwen backend.
+[CI](.github/workflows/ci.yml) runs the suite on Ubuntu with Python 3.12 for main pushes and pull requests. Windows console behavior also has adapter tests with fake console events; this is not a CI guarantee for every terminal. Passing offline tests does not validate an installed Qwen backend, semantic correctness, or production readiness.
 
-## Limitations
+The [claim-to-source checklist](docs/portfolio-review.md#technical-claim-to-source-checklist) maps the important assertions to implementation and tests. Historical transcripts record their original revisions and environments, not current performance measurements.
 
-- No sandbox: workers and verification commands run with the harness user's permissions. Use trusted commands and an isolated target worktree.
-- Scope enforcement is detection and acceptance gating, not filesystem access control. Verification/reviewer side effects fall outside the captured worker evidence; use checks and reviewers that do not modify the target worktree.
-- Git snapshots cover Git-visible state, not ignored files, external side effects, or changes that are reverted before capture. Temporary indexes still write Git objects to the repository's object store.
-- No built-in hosted planner/reviewer adapters, multi-provider routing, automatic rollback, or durable audit storage.
-- Dependency versions are lower-bounded rather than locked; cross-platform behavior and live worker integrations need additional validation.
-- The library controller and single-run CLI are separate execution paths; reviewer-controlled remediation is available through the controller API.
+## Limitations and non-goals
 
-## License
+- **No sandbox.** Workers and checks run with the harness user's permissions. File scope detects violations and gates acceptance; it neither prevents writes nor rolls them back.
+- **Git-visible evidence only.** Ignored files, external effects, and changes reverted before capture are outside the observation. Temporary indexes still write Git objects.
+- **Checks are supplied by the caller.** Empty checks pass in `run` and the default library path; `control` requires a non-advisory check. Command behavior and reproducibility depend on the environment.
+- **Freshness has a finite boundary.** `run` and default library reviewers do not recapture verifier/reviewer side effects before acceptance. `control` detects observed Git drift, but races remain between and after observations.
+- **Saved records are sensitive and unauthenticated.** Reports and control records can contain source and output. Create-only publication does not make them tamper-proof, crash-durable, or executable resume checkpoints.
+- **Output directories require operator judgment.** An external directory can still be a Git include, hook input, or watched resource. The harness checks known root overlap; it cannot certify complete operational independence.
+- **Bounded waits are not OS containment.** Descendants may escape observation; blocked OS calls and cleanup uncertainty remain possible. No universal hard wall-clock guarantee is claimed.
+- No automatic rollback, provider routing, live supervisor adapter, or automatic push, pull request, or merge. Dependencies are lower-bounded rather than locked.
 
-MIT. See [LICENSE](LICENSE).
+## Engineering case study
+
+An eight-slide explanation of the architecture, failure cases, and evidence boundaries: [view the PDF](docs/portfolio/coding-agent-harness-case-study.pdf) · [download the editable PowerPoint](docs/portfolio/coding-agent-harness-case-study.pptx). See the [architecture](docs/architecture.md), [engineering decisions](docs/engineering-decisions.md), [speaker notes](docs/portfolio/speaker-notes.md), and [evidence checklist](docs/portfolio/evidence-checklist.md).
+
+## Explore the implementation
+
+- [Architecture and trust boundaries](docs/architecture.md) — evidence lineage, authority, controller API.
+- [CLI and task guide](docs/usage.md) — setup, exact options, human workflow, exit codes.
+- [Single-run report contract](docs/reports.md) — trusted directory, captured content, publication failures.
+- [Offline supervisor handoff](docs/supervisor-handoff.md) — proposals, exact approval bindings, nonexecuting preflight.
+- [Engineering findings](docs/engineering-notes.md) — rename scope, subprocess deadlines, and failure disclosure.
+- [Documentation review](docs/portfolio-review.md) — audit, before/after outline, claim sources, validation limits.
+
+Initiated and directed by **Matias Laukka** as an investigation into supervised coding agents and reliable evaluation. He set requirements and priorities, reviewed results, and made acceptance decisions, with extensive AI collaboration across architecture, implementation, investigation, testing, and adversarial review.
+
+MIT · [License](LICENSE)

@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="206" viewBox="0 0 560 180" role="img" aria-labelledby="identity-title identity-desc">
+<title id="identity-title">Coding Agent Harness</title>
+<desc id="identity-desc">Execution. Evidence. Human authority. An original three-trace mark distinguishes a dashed claim from two observed evidence trails and an explicit decision boundary. It is a visual identity, not an execution diagram.</desc>
+<rect width="560" height="180" rx="16" fill="#11191f"/>
+<g font-family="Segoe UI, Arial, sans-serif">
+<text x="24" y="53" font-size="35" font-weight="650" fill="#f2f6f8">Coding Agent</text>
+<text x="24" y="108" font-size="52" font-weight="700" fill="#f2f6f8">Harness</text>
+<text x="24" y="151" font-size="22" fill="#bbc9d1">Execution. Evidence. Human authority.</text>
+</g>
+<g fill="none" stroke-width="3">
+<path d="M389 35 H463" stroke="#bbc9d1" stroke-dasharray="5 5"/>
+<path d="M389 68 H463 M389 101 H463" stroke="#6de0ce"/>
+<path d="M481 23 H499 V113 H481" stroke="#f1c27b"/>
+<circle cx="377" cy="35" r="5" stroke="#bbc9d1"/>
+<circle cx="377" cy="68" r="5" stroke="#6de0ce"/>
+<circle cx="377" cy="101" r="5" stroke="#6de0ce"/>
+</g>
+</svg>
