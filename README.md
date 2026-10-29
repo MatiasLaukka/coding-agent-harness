@@ -4,6 +4,12 @@
 
 A Python orchestration harness for bounded coding tasks. It runs a worker, collects Git evidence separately from the worker’s account, executes configured checks, and makes review an explicit step.
 
+A coding agent is an AI assistant that can edit files and run commands. Imagine asking one to change two files and run the tests. It reports success, but that message alone cannot show which files changed or whether the checks passed. The harness observes Git changes after the worker exits and runs the caller's configured checks separately from that report. A human can then review the evidence through `control` and decide whether to accept the work, subject to the controller's gates. `run` produces findings for review rather than acceptance.
+
+These observations cover Git-visible changes and the supplied checks. They do not provide a security sandbox, prove semantic correctness, or remove the need for human judgment.
+
+[View the Engineering Case Study (PDF)](docs/presentations/coding-agent-harness-case-study.pdf) for an illustrated overview of the architecture, engineering decisions, defect investigations, evidence and limitations. [Editable PowerPoint](docs/portfolio/coding-agent-harness-case-study.pptx).
+
 Built around a question: **what must be observed—and who must decide—before an agent’s work can be accepted?** The answer includes failure, disagreement, and permission to try again.
 
 **Experimental · Python 3.12+ · Offline regression suite · Windows console review**
@@ -135,7 +141,7 @@ The [claim-to-source checklist](docs/portfolio-review.md#technical-claim-to-sour
 
 ## Engineering case study
 
-An eight-slide explanation of the architecture, failure cases, and evidence boundaries: [view the PDF](docs/portfolio/coding-agent-harness-case-study.pdf) · [download the editable PowerPoint](docs/portfolio/coding-agent-harness-case-study.pptx). See the [architecture](docs/architecture.md), [engineering decisions](docs/engineering-decisions.md), [speaker notes](docs/portfolio/speaker-notes.md), and [evidence checklist](docs/portfolio/evidence-checklist.md).
+An eight-slide explanation of the architecture, failure cases, and evidence boundaries: [view the PDF](docs/presentations/coding-agent-harness-case-study.pdf) · [download the editable PowerPoint](docs/portfolio/coding-agent-harness-case-study.pptx). The opening includes a plain-language example; the existing investigations and historical results are preserved. See the [architecture](docs/architecture.md), [engineering decisions](docs/engineering-decisions.md), [speaker notes](docs/portfolio/speaker-notes.md), and [evidence checklist](docs/portfolio/evidence-checklist.md).
 
 ## Explore the implementation
 
